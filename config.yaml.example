@@ -1,19 +1,23 @@
 # MeshCore Repeater Placement Analysis Tool — Configuration
 
 # Serial port the USB companion device is connected to
-serial_port: "COM7"
+serial_port: "COM3"
 baud_rate: 115200
 
 # Repeater of interest — name from contacts or 2-char hex hash (override with --roi)
-repeater_of_interest: "Kyiv_SoldSlobidka_R1"
+repeater_of_interest: "MyRepeater_R1"
 
 # Manual path to ROI — skip auto-discovery if set.
 #   "" (empty)  — auto-discover path (default)
 #   "direct"    — ROI is directly reachable, no intermediates
 #   "aa,bb"     — use these hex hashes as intermediate hops
-# repeater_of_interest_path: "direct"
-# repeater_of_interest_path: "55,b0"
-repeater_of_interest_path: "55"
+repeater_of_interest_path: ""
+
+# Only include repeaters whose name starts with this prefix (empty = all)
+repeater_prefix: ""
+
+# Comma-separated repeater names to exclude from discovery/measurement
+exclude_repeaters: ""
 
 # Number of SNR trace samples to collect per neighbour
 snr_samples: 3

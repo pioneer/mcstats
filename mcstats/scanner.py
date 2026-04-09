@@ -92,6 +92,17 @@ def _contact_hash(contact: dict, hash_len: int = 1) -> str:
     return pk[: hash_len * 2]  # hex chars = 2 × bytes
 
 
+def _filter_repeaters(repeaters: list[dict], prefix: str, exclude: str) -> list[dict]:
+    """Filter repeaters by name prefix and exclusion list."""
+    result = repeaters
+    if prefix:
+        result = [r for r in result if r.get("adv_name", "").startswith(prefix)]
+    if exclude:
+        excluded = {n.strip() for n in exclude.split(",") if n.strip()}
+        result = [r for r in result if r.get("adv_name", "") not in excluded]
+    return result
+
+
 def _find_roi(repeaters: list[dict], roi_spec: str) -> dict | None:
     """Find a repeater by advertisement name or 2-char hex hash."""
     # Try exact name match first
@@ -127,6 +138,24 @@ def _roi_path_from_config(roi_hash: str, manual_path: str) -> RoiPath | None:
         return RoiPath(roi_hash=roi_hash, intermediate_hashes=[], hash_len=1)
     hashes = [h.strip() for h in value.split(",") if h.strip()]
     return RoiPath(roi_hash=roi_hash, intermediate_hashes=hashes, hash_len=1)
+
+
+async def _sync_firmware_path(
+    mc: MeshCore,
+    roi: dict,
+    roi_path: RoiPath,
+    verbose: bool = False,
+) -> None:
+    """Update the firmware's contact table so binary requests can route to the ROI."""
+    path_hex = "".join(roi_path.intermediate_hashes)
+    if path_hex:
+        if verbose:
+            console.print(f"  [dim]change_contact_path → {path_hex}[/]")
+        await mc.commands.change_contact_path(roi, path_hex)
+    else:
+        if verbose:
+            console.print("  [dim]reset_path (direct)[/]")
+        await mc.commands.reset_path(roi)
 
 
 async def _send_trace_and_wait(
@@ -172,6 +201,53 @@ async def get_roi_display(mc: MeshCore, roi_spec: str) -> tuple[str, str]:
     if roi is None:
         return roi_spec, ""
     return roi.get("adv_name", roi_spec), _contact_hash(roi)
+
+
+async def fetch_roi_neighbours(
+    mc: MeshCore,
+    roi: dict,
+    timeout: float,
+    verbose: bool = False,
+) -> list[dict]:
+    """Ask the ROI for its neighbour list via the binary protocol.
+
+    Returns a list of lightweight contact dicts (pubkey prefix + SNR only)
+    that can be used as trace candidates even if they are not in our
+    local contact list.
+    """
+    name = roi.get("adv_name", "?")
+    console.print(f"\n[bold]Fetching neighbour list from ROI [cyan]{name}[/] …[/]")
+    try:
+        result = await mc.commands.req_neighbours_sync(roi, timeout=timeout)
+    except Exception as exc:
+        console.print(f"  [yellow]req_neighbours_sync failed: {exc}[/]")
+        return []
+
+    if result is None:
+        console.print("  [yellow]No response from ROI.[/]")
+        return []
+
+    neighbours = result.get("neighbours", [])
+    console.print(f"  ROI reports [green]{result.get('neighbours_count', '?')}[/] neighbour(s), "
+                  f"received [green]{len(neighbours)}[/]")
+
+    remote_contacts: list[dict] = []
+    for n in neighbours:
+        pk = n.get("pubkey", "")
+        snr = n.get("snr")
+        secs = n.get("secs_ago")
+        snr_str = f" SNR={snr:+.1f}" if isinstance(snr, (int, float)) else ""
+        age_str = f" {secs}s ago" if isinstance(secs, int) else ""
+        if verbose:
+            console.print(f"    [dim]{pk}{snr_str}{age_str}[/]")
+        remote_contacts.append({
+            "public_key": pk,
+            "adv_name": f"remote_{pk[:4]}",
+            "type": CONTACT_TYPE_REPEATER,
+            "_remote": True,
+        })
+
+    return remote_contacts
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +513,11 @@ async def discover_neighbours(
     of the ROI — because no extra hops between ROI and candidate.
     """
     neighbours: list[dict] = []
+    n_intermediates = len(roi_path.intermediate_hashes)
+    # In the round-trip trace hops:
+    #   [int0, int1, ..., ROI, N, ROI, ..., int1, int0, (client)]
+    nbr_hop_idx = n_intermediates + 1     # outbound SNR (ROI → N)
+    roi_return_idx = n_intermediates + 2   # inbound SNR (N → ROI)
 
     for cand in candidates:
         cand_hash = _contact_hash(cand, roi_path.hash_len)
@@ -457,12 +538,20 @@ async def discover_neighbours(
 
             if trace is not None:
                 path_data = trace.get("path", [])
-                snr_info = ""
-                for hop in reversed(path_data):
-                    if "hash" in hop and hop.get("snr") is not None:
-                        snr_info = f" SNR={hop['snr']:+.1f} dB"
-                        break
-                console.print(f"  [cyan]{name_h}[/] → [green]reachable[/]{snr_info} [dim](attempt {attempt})[/]")
+                # Extract out SNR (ROI → N) and in SNR (N → ROI)
+                out_snr = None
+                in_snr = None
+                if nbr_hop_idx < len(path_data):
+                    out_snr = path_data[nbr_hop_idx].get("snr")
+                if roi_return_idx < len(path_data):
+                    in_snr = path_data[roi_return_idx].get("snr")
+                out_str = f"{out_snr:+.1f}" if isinstance(out_snr, (int, float)) else "?"
+                in_str = f"{in_snr:+.1f}" if isinstance(in_snr, (int, float)) else "?"
+                console.print(
+                    f"  [cyan]{name_h}[/] → [green]reachable[/]"
+                    f"  out={out_str} dB  in={in_str} dB"
+                    f" [dim](attempt {attempt})[/]"
+                )
                 neighbours.append(cand)
                 found = True
                 break
@@ -602,8 +691,27 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
         console.print("[red]Cannot reach ROI — aborting.[/]")
         return []
 
-    # 3. Discover zero-hop neighbours
+    # Sync the firmware's contact table so binary requests can route
+    await _sync_firmware_path(mc, roi, roi_path, verbose=verbose)
+
+    # 3. Fetch the ROI's own neighbour list & merge with local candidates
     candidates = [r for r in repeaters if r is not roi]
+    # Apply prefix / exclude filters
+    prefix = cfg.get("repeater_prefix", "")
+    exclude = cfg.get("exclude_repeaters", "")
+    candidates = _filter_repeaters(candidates, prefix, exclude)
+    local_hashes = {_contact_hash(r) for r in candidates}
+    remote_nbrs = await fetch_roi_neighbours(mc, roi, timeout, verbose=verbose)
+    new_remote = [r for r in remote_nbrs if _contact_hash(r) not in local_hashes
+                  and _contact_hash(r) != _contact_hash(roi)]
+    if new_remote:
+        console.print(f"  [green]{len(new_remote)}[/] remote neighbour(s) not in local contacts — added as candidates")
+        for r in new_remote:
+            h = _contact_hash(r)
+            console.print(f"    {r.get('adv_name', '?')} [dim]({h})[/]")
+        candidates.extend(new_remote)
+
+    # 4. Discover zero-hop neighbours
     console.print(f"\n[bold]Discovering neighbours of ROI via {len(candidates)} candidate(s) …[/]")
     neighbours = await discover_neighbours(mc, roi_path, candidates, retries, timeout, verbose=verbose)
     if not neighbours:
@@ -694,6 +802,8 @@ async def _measure_with_neighbours(
     if roi_path is None:
         console.print("[red]Cannot reach ROI.[/]")
         return []
+
+    await _sync_firmware_path(mc, roi, roi_path, verbose=verbose)
 
     console.print(f"\n[bold]Measuring SNR for {len(neighbours)} neighbour(s) …[/]")
     return await gather_snr(mc, roi_path, neighbours, samples, timeout, penalty, verbose=verbose)

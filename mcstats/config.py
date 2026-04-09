@@ -10,6 +10,8 @@ DEFAULTS: dict[str, Any] = {
     "baud_rate": 115200,
     "repeater_of_interest": "",
     "repeater_of_interest_path": "",
+    "repeater_prefix": "",
+    "exclude_repeaters": "",
     "snr_samples": 3,
     "timeout_penalty_db": -30,
     "flood_retries": 2,
@@ -23,10 +25,14 @@ def load_config(path: str | pathlib.Path = "config.yaml", **overrides: Any) -> d
     cfg = dict(DEFAULTS)
 
     p = pathlib.Path(path)
-    if p.exists():
-        with p.open("r", encoding="utf-8") as f:
-            file_cfg = yaml.safe_load(f) or {}
-        cfg.update(file_cfg)
+    if not p.exists():
+        raise SystemExit(
+            f"Config file not found: {p}\n"
+            f"  Copy config.yaml.example to config.yaml and edit it."
+        )
+    with p.open("r", encoding="utf-8") as f:
+        file_cfg = yaml.safe_load(f) or {}
+    cfg.update(file_cfg)
 
     # CLI overrides: only apply values that were explicitly provided
     for k, v in overrides.items():

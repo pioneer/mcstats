@@ -16,20 +16,27 @@ def _run(coro):
     help={
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
+        "prefix": "Only show repeaters whose name starts with this prefix",
+        "exclude": "Comma-separated repeater names to exclude",
     },
 )
-def list_repeaters(c, config="config.yaml", verbose=False):
+def list_repeaters(c, config="config.yaml", verbose=False, prefix=None, exclude=None):
     """List all repeater contacts on the device."""
 
     async def _inner():
         from mcstats.config import load_config
         from mcstats.connection import connect
         from mcstats.display import show_repeaters
-        from mcstats.scanner import get_repeaters
+        from mcstats.scanner import get_repeaters, _filter_repeaters
 
-        cfg = load_config(config, verbose=verbose)
+        cfg = load_config(config, verbose=verbose, repeater_prefix=prefix, exclude_repeaters=exclude)
         async with connect(cfg) as mc:
             repeaters = await get_repeaters(mc)
+            repeaters = _filter_repeaters(
+                repeaters,
+                cfg.get("repeater_prefix", ""),
+                cfg.get("exclude_repeaters", ""),
+            )
             show_repeaters(repeaters)
 
     _run(_inner())
@@ -40,9 +47,11 @@ def list_repeaters(c, config="config.yaml", verbose=False):
         "roi": "Name or hex hash of the repeater of interest (overrides config)",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
+        "prefix": "Only include repeaters whose name starts with this prefix",
+        "exclude": "Comma-separated repeater names to exclude",
     },
 )
-def discover(c, roi=None, config="config.yaml", verbose=False):
+def discover(c, roi=None, config="config.yaml", verbose=False, prefix=None, exclude=None):
     """Discover zero-hop neighbours of the ROI and save to cache."""
 
     async def _inner():
@@ -54,6 +63,8 @@ def discover(c, roi=None, config="config.yaml", verbose=False):
             config,
             repeater_of_interest=roi,
             verbose=verbose,
+            repeater_prefix=prefix,
+            exclude_repeaters=exclude,
         )
 
         if not cfg["repeater_of_interest"]:
@@ -74,9 +85,12 @@ def discover(c, roi=None, config="config.yaml", verbose=False):
         "samples": "Number of SNR samples per neighbour",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
+        "prefix": "Only include repeaters whose name starts with this prefix",
+        "exclude": "Comma-separated repeater names to exclude",
+        "csv": "Path to write CSV output file",
     },
 )
-def scan(c, roi=None, samples=None, config="config.yaml", verbose=False):
+def scan(c, roi=None, samples=None, config="config.yaml", verbose=False, prefix=None, exclude=None, csv=None):
     """Full scan: discover neighbours of the ROI, gather SNR."""
 
     async def _inner():
@@ -90,6 +104,8 @@ def scan(c, roi=None, samples=None, config="config.yaml", verbose=False):
             repeater_of_interest=roi,
             snr_samples=int(samples) if samples is not None else None,
             verbose=verbose,
+            repeater_prefix=prefix,
+            exclude_repeaters=exclude,
         )
 
         if not cfg["repeater_of_interest"]:
@@ -103,6 +119,11 @@ def scan(c, roi=None, samples=None, config="config.yaml", verbose=False):
             from mcstats.scanner import get_roi_display
             roi_name, roi_h = await get_roi_display(mc, cfg["repeater_of_interest"])
             show_stats(stats, cfg["timeout_penalty_db"], roi_name, roi_h)
+            if csv:
+                from mcstats.csv_export import write_csv
+                p = write_csv(stats, cfg["timeout_penalty_db"], csv, roi_name)
+                from rich.console import Console
+                Console().print(f"  CSV written → [dim]{p}[/]")
 
     _run(_inner())
 
@@ -114,9 +135,12 @@ def scan(c, roi=None, samples=None, config="config.yaml", verbose=False):
         "samples": "Number of SNR samples per neighbour",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
+        "prefix": "Only include repeaters whose name starts with this prefix",
+        "exclude": "Comma-separated repeater names to exclude",
+        "csv": "Path to write CSV output file",
     },
 )
-def measure_snr(c, roi=None, neighbour=None, samples=None, config="config.yaml", verbose=False):
+def measure_snr(c, roi=None, neighbour=None, samples=None, config="config.yaml", verbose=False, prefix=None, exclude=None, csv=None):
     """Measure SNR using cached neighbours. Run 'invoke discover' first."""
 
     async def _inner():
@@ -130,6 +154,8 @@ def measure_snr(c, roi=None, neighbour=None, samples=None, config="config.yaml",
             repeater_of_interest=roi,
             snr_samples=int(samples) if samples is not None else None,
             verbose=verbose,
+            repeater_prefix=prefix,
+            exclude_repeaters=exclude,
         )
 
         if not cfg["repeater_of_interest"]:
@@ -145,5 +171,10 @@ def measure_snr(c, roi=None, neighbour=None, samples=None, config="config.yaml",
             from mcstats.scanner import get_roi_display
             roi_name, roi_h = await get_roi_display(mc, cfg["repeater_of_interest"])
             show_stats(stats, cfg["timeout_penalty_db"], roi_name, roi_h)
+            if csv:
+                from mcstats.csv_export import write_csv
+                p = write_csv(stats, cfg["timeout_penalty_db"], csv, roi_name)
+                from rich.console import Console
+                Console().print(f"  CSV written → [dim]{p}[/]")
 
     _run(_inner())
