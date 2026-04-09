@@ -4,7 +4,7 @@
 serial_port: "COM7"
 baud_rate: 115200
 
-# Default repeater of interest (override with --roi on the CLI)
+# Repeater of interest — name from contacts or 2-char hex hash (override with --roi)
 repeater_of_interest: "Kyiv_SoldSlobidka_R1"
 
 # Manual path to ROI — skip auto-discovery if set.

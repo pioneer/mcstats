@@ -34,7 +34,7 @@ def _color_avg(val: float | None) -> str:
     return f"[red]{txt}[/]"
 
 
-def show_stats(stats: list[NeighbourStats], penalty: float, roi_name: str = "") -> None:
+def show_stats(stats: list[NeighbourStats], penalty: float, roi_name: str = "", roi_hash: str = "") -> None:
     """Render a rich table showing per-attempt and average SNR."""
     if not stats:
         console.print("[yellow]No stats to display.[/]")
@@ -45,7 +45,11 @@ def show_stats(stats: list[NeighbourStats], penalty: float, roi_name: str = "") 
         max(len(s.in_snr_samples) for s in stats),
     )
 
-    title = f"SNR Report — ROI: {roi_name}" if roi_name else "Repeater Neighbour SNR Report"
+    if roi_name:
+        label = f"{roi_name} ({roi_hash})" if roi_hash else roi_name
+        title = f"SNR Report \u2014 ROI: {label}"
+    else:
+        title = "Repeater Neighbour SNR Report"
     table = Table(
         title=title,
         show_lines=True,

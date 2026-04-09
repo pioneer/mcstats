@@ -39,7 +39,7 @@ Copy or edit `config.yaml` in the project root:
 serial_port: "COM7"
 baud_rate: 115200
 
-repeater_of_interest: "MyRepeater_R1"
+repeater_of_interest: "MyRepeater_R1"  # or hex hash, e.g. "b0"
 
 # Manual path to ROI (skip auto-discovery):
 #   ""         — auto-discover (default)
@@ -99,7 +99,7 @@ invoke measure-snr --neighbour "Repeater_A,Repeater_B" --samples 10
 
 | Flag | Description |
 |---|---|
-| `--roi NAME` | Override `repeater_of_interest` from config |
+| `--roi NAME` | Override `repeater_of_interest` from config (name or hex hash) |
 | `--config PATH` | Use a different config file (default: `config.yaml`) |
 | `--samples N` | Number of SNR trace samples per neighbour |
 | `--verbose` | Enable debug-level meshcore logging |

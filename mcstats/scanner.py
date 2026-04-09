@@ -92,6 +92,20 @@ def _contact_hash(contact: dict, hash_len: int = 1) -> str:
     return pk[: hash_len * 2]  # hex chars = 2 × bytes
 
 
+def _find_roi(repeaters: list[dict], roi_spec: str) -> dict | None:
+    """Find a repeater by advertisement name or 2-char hex hash."""
+    # Try exact name match first
+    roi = next((r for r in repeaters if r.get("adv_name") == roi_spec), None)
+    if roi:
+        return roi
+    # Try as hex hash (case-insensitive)
+    spec_lower = roi_spec.strip().lower()
+    for r in repeaters:
+        if _contact_hash(r).lower() == spec_lower:
+            return r
+    return None
+
+
 def _split_path_hashes(out_path: str, hash_len: int, count: int) -> list[str]:
     """Split a concatenated hex path into individual hop hashes."""
     chars_per_hash = hash_len * 2
@@ -142,6 +156,22 @@ async def _send_trace_and_wait(
     if verbose:
         console.print(f"    [dim]trace evt = {evt}[/]")
     return evt.payload if evt else None
+
+
+async def get_roi_hash(mc: MeshCore, roi_spec: str) -> str:
+    """Look up the 2-char hex hash for a ROI by name or hash. Returns '' if not found."""
+    repeaters = await get_repeaters(mc)
+    roi = _find_roi(repeaters, roi_spec)
+    return _contact_hash(roi) if roi else ""
+
+
+async def get_roi_display(mc: MeshCore, roi_spec: str) -> tuple[str, str]:
+    """Return (display_name, hex_hash) for a ROI spec. Falls back to (roi_spec, '')."""
+    repeaters = await get_repeaters(mc)
+    roi = _find_roi(repeaters, roi_spec)
+    if roi is None:
+        return roi_spec, ""
+    return roi.get("adv_name", roi_spec), _contact_hash(roi)
 
 
 # ---------------------------------------------------------------------------
@@ -547,13 +577,13 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
     console.print(f"  Found [green]{len(repeaters)}[/] repeater(s)")
 
     # Identify ROI
-    roi = next((r for r in repeaters if r.get("adv_name") == roi_name), None)
+    roi = _find_roi(repeaters, roi_name)
     if roi is None:
         console.print(f"[red]ROI '{roi_name}' not found in contacts.[/]")
         return []
 
     # 2. Establish path to ROI
-    others = [r for r in repeaters if r.get("adv_name") != roi_name]
+    others = [r for r in repeaters if r is not roi]
     manual_path = cfg.get("repeater_of_interest_path", "")
     roi_hash = _contact_hash(roi)
     roi_path = _roi_path_from_config(roi_hash, manual_path)
@@ -573,7 +603,7 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
         return []
 
     # 3. Discover zero-hop neighbours
-    candidates = [r for r in repeaters if r.get("adv_name") != roi_name]
+    candidates = [r for r in repeaters if r is not roi]
     console.print(f"\n[bold]Discovering neighbours of ROI via {len(candidates)} candidate(s) …[/]")
     neighbours = await discover_neighbours(mc, roi_path, candidates, retries, timeout, verbose=verbose)
     if not neighbours:
@@ -642,12 +672,12 @@ async def _measure_with_neighbours(
     verbose: bool = cfg.get("verbose", False)
 
     repeaters = await get_repeaters(mc)
-    roi = next((r for r in repeaters if r.get("adv_name") == roi_name), None)
+    roi = _find_roi(repeaters, roi_name)
     if roi is None:
         console.print(f"[red]ROI '{roi_name}' not found.[/]")
         return []
 
-    others = [r for r in repeaters if r.get("adv_name") != roi_name]
+    others = [r for r in repeaters if r is not roi]
     manual_path = cfg.get("repeater_of_interest_path", "")
     roi_hash = _contact_hash(roi)
     roi_path = _roi_path_from_config(roi_hash, manual_path)

@@ -37,7 +37,7 @@ def list_repeaters(c, config="config.yaml", verbose=False):
 
 @task(
     help={
-        "roi": "Name of the repeater of interest (overrides config)",
+        "roi": "Name or hex hash of the repeater of interest (overrides config)",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
     },
@@ -70,7 +70,7 @@ def discover(c, roi=None, config="config.yaml", verbose=False):
 
 @task(
     help={
-        "roi": "Name of the repeater of interest (overrides config)",
+        "roi": "Name or hex hash of the repeater of interest (overrides config)",
         "samples": "Number of SNR samples per neighbour",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
@@ -100,14 +100,16 @@ def scan(c, roi=None, samples=None, config="config.yaml", verbose=False):
 
         async with connect(cfg) as mc:
             stats = await run_scan(mc, cfg)
-            show_stats(stats, cfg["timeout_penalty_db"], cfg["repeater_of_interest"])
+            from mcstats.scanner import get_roi_display
+            roi_name, roi_h = await get_roi_display(mc, cfg["repeater_of_interest"])
+            show_stats(stats, cfg["timeout_penalty_db"], roi_name, roi_h)
 
     _run(_inner())
 
 
 @task(
     help={
-        "roi": "Name of the repeater of interest (overrides config)",
+        "roi": "Name or hex hash of the repeater of interest (overrides config)",
         "neighbour": "Comma-separated list of specific neighbour names to measure (optional)",
         "samples": "Number of SNR samples per neighbour",
         "config": "Path to config YAML file (default: config.yaml)",
@@ -140,6 +142,8 @@ def measure_snr(c, roi=None, neighbour=None, samples=None, config="config.yaml",
 
         async with connect(cfg) as mc:
             stats = await run_measure(mc, cfg, nbr_names)
-            show_stats(stats, cfg["timeout_penalty_db"], cfg["repeater_of_interest"])
+            from mcstats.scanner import get_roi_display
+            roi_name, roi_h = await get_roi_display(mc, cfg["repeater_of_interest"])
+            show_stats(stats, cfg["timeout_penalty_db"], roi_name, roi_h)
 
     _run(_inner())
