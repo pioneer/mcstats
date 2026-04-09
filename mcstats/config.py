@@ -9,6 +9,7 @@ DEFAULTS: dict[str, Any] = {
     "serial_port": "COM3",
     "baud_rate": 115200,
     "repeater_of_interest": "",
+    "repeater_of_interest_path": "",
     "snr_samples": 3,
     "timeout_penalty_db": -30,
     "flood_retries": 2,

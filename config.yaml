@@ -7,6 +7,14 @@ baud_rate: 115200
 # Default repeater of interest (override with --roi on the CLI)
 repeater_of_interest: "Kyiv_SoldSlobidka_R1"
 
+# Manual path to ROI — skip auto-discovery if set.
+#   "" (empty)  — auto-discover path (default)
+#   "direct"    — ROI is directly reachable, no intermediates
+#   "aa,bb"     — use these hex hashes as intermediate hops
+# repeater_of_interest_path: "direct"
+# repeater_of_interest_path: "55,b0"
+repeater_of_interest_path: "55"
+
 # Number of SNR trace samples to collect per neighbour
 snr_samples: 3
 

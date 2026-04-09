@@ -99,6 +99,22 @@ def _split_path_hashes(out_path: str, hash_len: int, count: int) -> list[str]:
             for i in range(count)]
 
 
+def _roi_path_from_config(roi_hash: str, manual_path: str) -> RoiPath | None:
+    """Build a RoiPath from the ``repeater_of_interest_path`` config value.
+
+    Returns None when the value is empty (meaning auto-discover).
+    ``"direct"`` → direct path (no intermediates).
+    ``"aa,bb"`` → use those hex hashes as intermediate hops.
+    """
+    value = manual_path.strip()
+    if not value:
+        return None
+    if value.lower() == "direct":
+        return RoiPath(roi_hash=roi_hash, intermediate_hashes=[], hash_len=1)
+    hashes = [h.strip() for h in value.split(",") if h.strip()]
+    return RoiPath(roi_hash=roi_hash, intermediate_hashes=hashes, hash_len=1)
+
+
 async def _send_trace_and_wait(
     mc: MeshCore,
     path_str: str,
@@ -154,6 +170,8 @@ async def establish_path_to_roi(
     mc: MeshCore,
     roi: dict,
     timeout: float,
+    other_repeaters: list[dict] | None = None,
+    max_hops: int = 3,
     verbose: bool = False,
 ) -> RoiPath | None:
     """Establish a working path to *roi*.
@@ -161,7 +179,8 @@ async def establish_path_to_roi(
     Strategy:
       1. Try a direct trace first (fast path for directly-reachable ROI).
       2. If that fails, do full path discovery (reset → flood → discover).
-      3. Verify the discovered path with a trace.
+      3. If path discovery also fails, BFS through known repeaters up to
+         *max_hops* intermediate hops.
 
     Returns a RoiPath on success, or None if unreachable.
     """
@@ -203,20 +222,57 @@ async def establish_path_to_roi(
         console.print(f"    [dim]send_path_discovery → type={res.type} payload={res.payload}[/]")
     if res.type == EventType.ERROR:
         console.print(f"  [red]Path discovery failed:[/] {res.payload}")
+        # Fall through to BFS below
+    else:
+        suggested = res.payload.get("suggested_timeout", 0)
+        wait = max(timeout, suggested / 1000 * 1.2) if suggested else timeout
+        if verbose:
+            console.print(f"    [dim]waiting {wait:.1f}s for PATH_RESPONSE …[/]")
+        roi_pubkey_pre = roi.get("public_key", roi.get("pubkey", ""))[:12]
+        path_evt = await mc.wait_for_event(
+            EventType.PATH_RESPONSE,
+            attribute_filters={"pubkey_pre": roi_pubkey_pre} if roi_pubkey_pre else None,
+            timeout=wait,
+        )
+        if verbose:
+            console.print(f"    [dim]path_evt = {path_evt}[/]")
+
+        if path_evt:
+            return await _apply_discovered_path(mc, roi, path_evt, roi_hash_1b, timeout, verbose)
+
+        console.print("  [yellow]No path response from protocol.[/]")
+
+    # 3. BFS: try multi-hop paths through known repeaters
+    if not other_repeaters:
+        console.print("  [red]ROI is unreachable (no other repeaters to try).[/]")
         return None
 
-    suggested = res.payload.get("suggested_timeout", 0)
-    wait = max(timeout, suggested / 1000 * 1.2) if suggested else timeout
-    if verbose:
-        console.print(f"    [dim]waiting {wait:.1f}s for PATH_RESPONSE …[/]")
-    path_evt = await mc.wait_for_event(EventType.PATH_RESPONSE, timeout=wait)
-    if verbose:
-        console.print(f"    [dim]path_evt = {path_evt}[/]")
+    result = await _bfs_find_path(
+        mc, roi_hash_1b, other_repeaters, timeout, max_hops, verbose,
+    )
+    if result:
+        return result
 
-    if not path_evt:
-        console.print("  [red]No path response — ROI is unreachable.[/]")
-        return None
+    console.print("  [red]ROI is unreachable.[/]")
+    return None
 
+
+def _format_snr_hops(path_data: list[dict]) -> str:
+    return " → ".join(
+        f"{h.get('snr'):+.1f}" if isinstance(h.get("snr"), (int, float)) else "?"
+        for h in path_data
+    )
+
+
+async def _apply_discovered_path(
+    mc: MeshCore,
+    roi: dict,
+    path_evt,
+    roi_hash_1b: str,
+    timeout: float,
+    verbose: bool,
+) -> RoiPath | None:
+    """Parse a PATH_RESPONSE, apply it, and verify with a trace."""
     out_path = path_evt.payload.get("out_path", "")
     out_path_len = path_evt.payload.get("out_path_len", 0)
     out_path_hash_len = path_evt.payload.get("out_path_hash_len", 1)
@@ -225,7 +281,6 @@ async def establish_path_to_roi(
         console.print(f"    [dim]out_path={out_path!r} len={out_path_len} hash_len={out_path_hash_len}[/]")
         console.print(f"    [dim]full payload: {path_evt.payload}[/]")
 
-    # Parse intermediate hops
     intermediate_hashes = _split_path_hashes(out_path, out_path_hash_len, out_path_len)
     hash_len = out_path_hash_len if out_path_len > 0 else 1
     roi_hash = _contact_hash(roi, hash_len)
@@ -241,24 +296,97 @@ async def establish_path_to_roi(
         f"trace to ROI: [cyan]{roi_path.trace_to_roi()}[/]"
     )
 
-    # Apply discovered outbound path
     if out_path:
         await mc.commands.change_contact_path(roi, out_path)
 
-    # 3. Verify with a trace
     console.print("  Verifying with trace …")
     trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
     if trace:
-        path_data = trace.get("path", [])
-        snr_strs = [
-            f"{h.get('snr'):+.1f}" if isinstance(h.get("snr"), (int, float)) else "?"
-            for h in path_data
-        ]
-        console.print(f"  [green]Path verified.[/] SNR per hop: {' → '.join(snr_strs)}")
+        console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
         return roi_path
     else:
         console.print("  [red]Trace to ROI failed — path not working.[/]")
         return None
+
+
+async def _bfs_find_path(
+    mc: MeshCore,
+    roi_hash: str,
+    repeaters: list[dict],
+    timeout: float,
+    max_hops: int,
+    verbose: bool,
+) -> RoiPath | None:
+    """BFS through known repeaters to find a multi-hop path to the ROI.
+
+    1. Quick scan to find directly-reachable repeaters.
+    2. Depth 1: try each reachable repeater as sole intermediate.
+    3. Depth 2+: extend with any repeater not already in the chain.
+
+    Only directly-reachable repeaters are used as the first hop.
+    """
+    hash_to_name: dict[str, str] = {}
+    for r in repeaters:
+        h = _contact_hash(r)
+        hash_to_name[h] = r.get("adv_name", "?")
+    all_hashes = list(hash_to_name.keys())
+
+    # Quick reachability scan
+    console.print(f"  [bold]Scanning reachability of {len(repeaters)} repeater(s) …[/]")
+    reachable: set[str] = set()
+    for r in repeaters:
+        h = _contact_hash(r)
+        probe = RoiPath(roi_hash=h, intermediate_hashes=[], hash_len=1)
+        trace = await _send_trace_and_wait(mc, probe.trace_to_roi(), timeout, verbose=verbose)
+        if trace:
+            reachable.add(h)
+            if verbose:
+                console.print(f"    [dim]{hash_to_name[h]} ({h}) — reachable[/]")
+        else:
+            if verbose:
+                console.print(f"    [dim]{hash_to_name[h]} ({h}) — not reachable[/]")
+    console.print(f"  {len(reachable)} directly-reachable repeater(s)")
+
+    if not reachable:
+        return None
+
+    # BFS by depth
+    chains: list[list[str]] = []
+    for depth in range(1, max_hops + 1):
+        if depth == 1:
+            chains = [[h] for h in reachable]
+        else:
+            new_chains: list[list[str]] = []
+            for chain in chains:
+                for h in all_hashes:
+                    if h not in chain and h != roi_hash:
+                        new_chains.append(chain + [h])
+            chains = new_chains
+
+        if not chains:
+            continue
+
+        console.print(f"  Trying {len(chains)} path(s) at depth {depth} …")
+        for chain in chains:
+            candidate = RoiPath(
+                roi_hash=roi_hash,
+                intermediate_hashes=chain,
+                hash_len=1,
+            )
+            trace_str = candidate.trace_to_roi()
+            if verbose:
+                path_names = " → ".join(hash_to_name.get(h, h) for h in chain)
+                console.print(f"    [dim]{path_names} → ROI: {trace_str}[/]")
+            trace = await _send_trace_and_wait(mc, trace_str, timeout, verbose=verbose)
+            if trace:
+                path_names = " → ".join(hash_to_name.get(h, h) for h in chain)
+                console.print(
+                    f"  [green]ROI reachable via {path_names}[/] "
+                    f"({depth} hop(s)). SNR: {_format_snr_hops(trace.get('path', []))}"
+                )
+                return candidate
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +411,9 @@ async def discover_neighbours(
     for cand in candidates:
         cand_hash = _contact_hash(cand, roi_path.hash_len)
         name = cand.get("adv_name", "?")
+        name_h = f"{name} ({cand_hash})"
         trace_path = roi_path.trace_to(cand_hash)
-        console.print(f"  Tracing [cyan]{name}[/] via ROI  path=[dim]{trace_path}[/]")
+        console.print(f"  Tracing [cyan]{name_h}[/] via ROI  path=[dim]{trace_path}[/]")
 
         found = False
         for attempt in range(1, retries + 1):
@@ -303,13 +432,13 @@ async def discover_neighbours(
                     if "hash" in hop and hop.get("snr") is not None:
                         snr_info = f" SNR={hop['snr']:+.1f} dB"
                         break
-                console.print(f"  [cyan]{name}[/] → [green]reachable[/]{snr_info} [dim](attempt {attempt})[/]")
+                console.print(f"  [cyan]{name_h}[/] → [green]reachable[/]{snr_info} [dim](attempt {attempt})[/]")
                 neighbours.append(cand)
                 found = True
                 break
 
         if not found:
-            console.print(f"  [cyan]{name}[/] → [red]not reachable[/]")
+            console.print(f"  [cyan]{name_h}[/] → [red]not reachable[/]")
 
     return neighbours
 
@@ -354,7 +483,7 @@ async def gather_snr(
         stats = NeighbourStats(name=name, pub_key=pk)
 
         trace_path_str = roi_path.trace_to(nbr_hash)
-        console.print(f"\n  Measuring [cyan]{name}[/] ({samples} samples)")
+        console.print(f"\n  Measuring [cyan]{name} ({nbr_hash})[/] ({samples} samples)")
         console.print(f"    trace path: [dim]{trace_path_str}[/]")
 
         for i in range(1, samples + 1):
@@ -412,6 +541,9 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
     if not repeaters:
         console.print("[red]No repeaters found.[/]")
         return []
+    for r in repeaters:
+        h = _contact_hash(r)
+        console.print(f"    {r.get('adv_name', '?')} [dim]({h})[/]")
     console.print(f"  Found [green]{len(repeaters)}[/] repeater(s)")
 
     # Identify ROI
@@ -421,7 +553,21 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
         return []
 
     # 2. Establish path to ROI
-    roi_path = await establish_path_to_roi(mc, roi, timeout, verbose=verbose)
+    others = [r for r in repeaters if r.get("adv_name") != roi_name]
+    manual_path = cfg.get("repeater_of_interest_path", "")
+    roi_hash = _contact_hash(roi)
+    roi_path = _roi_path_from_config(roi_hash, manual_path)
+    if roi_path:
+        console.print(f"\n[bold]Using configured path to ROI:[/] "
+                       f"{'direct' if not roi_path.intermediate_hashes else ','.join(roi_path.intermediate_hashes)}")
+        # Verify with a quick trace
+        trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
+        if trace:
+            console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
+        else:
+            console.print("  [yellow]Configured path did not respond — continuing anyway.[/]")
+    else:
+        roi_path = await establish_path_to_roi(mc, roi, timeout, other_repeaters=others, verbose=verbose)
     if roi_path is None:
         console.print("[red]Cannot reach ROI — aborting.[/]")
         return []
@@ -501,7 +647,20 @@ async def _measure_with_neighbours(
         console.print(f"[red]ROI '{roi_name}' not found.[/]")
         return []
 
-    roi_path = await establish_path_to_roi(mc, roi, timeout, verbose=verbose)
+    others = [r for r in repeaters if r.get("adv_name") != roi_name]
+    manual_path = cfg.get("repeater_of_interest_path", "")
+    roi_hash = _contact_hash(roi)
+    roi_path = _roi_path_from_config(roi_hash, manual_path)
+    if roi_path:
+        console.print(f"\n[bold]Using configured path to ROI:[/] "
+                       f"{'direct' if not roi_path.intermediate_hashes else ','.join(roi_path.intermediate_hashes)}")
+        trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
+        if trace:
+            console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
+        else:
+            console.print("  [yellow]Configured path did not respond — continuing anyway.[/]")
+    else:
+        roi_path = await establish_path_to_roi(mc, roi, timeout, other_repeaters=others, verbose=verbose)
     if roi_path is None:
         console.print("[red]Cannot reach ROI.[/]")
         return []

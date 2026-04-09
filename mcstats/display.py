@@ -3,7 +3,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.table import Table
 
-from .scanner import NeighbourStats, SnrSample
+from .scanner import NeighbourStats, SnrSample, _contact_hash
 
 console = Console()
 
@@ -62,7 +62,8 @@ def show_stats(stats: list[NeighbourStats], penalty: float, roi_name: str = "") 
     table.add_column("In Avg", justify="right", style="bold")
 
     for s in stats:
-        row: list[str] = [s.name]
+        h = s.pub_key[:2] if s.pub_key else "??"
+        row: list[str] = [f"{s.name} ({h})"]
 
         # Outbound samples
         for i in range(max_samples):
@@ -106,9 +107,10 @@ def show_repeaters(repeaters: list[dict]) -> None:
             path_len_str = str(path_len)
 
         pk = r.get("public_key", r.get("pubkey", ""))
+        h = _contact_hash(r)
         table.add_row(
             str(idx),
-            r.get("adv_name", "?"),
+            f"{r.get('adv_name', '?')} ({h})",
             path_len_str,
             r.get("out_path", "") or "—",
             pk[:12] + "…" if len(pk) > 12 else pk,
