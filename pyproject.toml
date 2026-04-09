@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcstats"
+version = "0.1.0"
+description = "MeshCore repeater placement analysis tool"
+requires-python = ">=3.10"
+dependencies = [
+    "meshcore>=0.1.0",
+    "invoke>=2.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "mypy"]

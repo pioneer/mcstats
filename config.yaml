@@ -1,0 +1,20 @@
+# MeshCore Repeater Placement Analysis Tool — Configuration
+
+# Serial port the USB companion device is connected to
+serial_port: "COM7"
+baud_rate: 115200
+
+# Default repeater of interest (override with --roi on the CLI)
+repeater_of_interest: "Kyiv_SoldSlobidka_R1"
+
+# Number of SNR trace samples to collect per neighbour
+snr_samples: 3
+
+# dB value assigned to timed-out trace attempts when computing averages
+timeout_penalty_db: -30
+
+# How many times to retry a flood message / trace before giving up
+flood_retries: 3
+
+# Seconds to wait for a trace response
+trace_timeout: 15
