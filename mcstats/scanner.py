@@ -117,6 +117,82 @@ def _filter_repeaters(repeaters: list[dict], prefix: str, exclude: str) -> list[
     return result
 
 
+def _select_candidates(repeaters: list[dict], candidates: str) -> list[dict]:
+    """Keep only repeaters matching the *candidates* allowlist.
+
+    ``candidates`` is a comma-separated list of repeater names or 2-char hex
+    hashes. An empty string means "no restriction" (all repeaters kept).
+    Order follows the allowlist, and entries that match nothing are ignored.
+    """
+    specs = [s.strip() for s in candidates.split(",") if s.strip()]
+    if not specs:
+        return repeaters
+
+    selected: list[dict] = []
+    seen: set[int] = set()
+    for spec in specs:
+        match = _find_roi(repeaters, spec)
+        if match is not None and id(match) not in seen:
+            selected.append(match)
+            seen.add(id(match))
+    return selected
+
+
+def _parse_corridors(spec: str, repeaters: list[dict]) -> list[list[str]]:
+    """Parse a ``--via`` spec into one or more ordered waypoint corridors.
+
+    Corridors are separated by ``;`` and each corridor is a comma-separated,
+    ordered list of repeater names or 2-char hex hashes, e.g.::
+
+        "55,b0,e5;55,b0,c0,e5"
+
+    Returns a list of corridors, each a list of resolved 2-char hashes in the
+    given order. Unresolvable waypoints are skipped; empty corridors dropped.
+    Duplicate corridors are removed while preserving first-seen order.
+    """
+    corridors: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for chunk in spec.split(";"):
+        if not chunk.strip():
+            continue
+        reps = _select_candidates(repeaters, chunk)
+        hashes = [_contact_hash(r) for r in reps]
+        key = tuple(hashes)
+        if hashes and key not in seen:
+            corridors.append(hashes)
+            seen.add(key)
+    return corridors
+
+
+def _select_tail_candidates(repeaters: list[dict], spec: str) -> list[dict]:
+    """Select tail-discovery candidates by exact hash, exact name, or name prefix.
+
+    ``spec`` is a comma-separated list of tokens. A repeater matches a token
+    when its 2-char hex hash equals the token (case-insensitive) *or* its
+    advertisement name starts with the token. A full name is therefore also a
+    valid (exact) prefix, so the same option covers both "a direct list of
+    repeaters" and "a set of name prefixes".
+
+    An empty spec means "no narrowing" — all repeaters are returned. Order
+    follows *repeaters* and duplicates are removed.
+    """
+    tokens = [t.strip() for t in spec.split(",") if t.strip()]
+    if not tokens:
+        return repeaters
+
+    selected: list[dict] = []
+    seen: set[int] = set()
+    for r in repeaters:
+        name = r.get("adv_name", "") or ""
+        h = _contact_hash(r).lower()
+        for tok in tokens:
+            if (h == tok.lower() or name.startswith(tok)) and id(r) not in seen:
+                selected.append(r)
+                seen.add(id(r))
+                break
+    return selected
+
+
 def _find_roi(repeaters: list[dict], roi_spec: str) -> dict | None:
     """Find a repeater by advertisement name or 2-char hex hash."""
     # Try exact name match first
@@ -510,6 +586,500 @@ async def _bfs_find_path(
 
 
 # ---------------------------------------------------------------------------
+# Thorough path finding (invoke findpath)
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class PathResult:
+    """A verified path to the target repeater and its quality metrics."""
+    roi_path: RoiPath
+    min_snr: float | None                       # weakest hop SNR (None if unknown)
+    avg_snr: float | None = None                # mean hop SNR (None if unknown)
+    hop_names: list[str] = dataclasses.field(default_factory=list)
+
+    @property
+    def n_hops(self) -> int:
+        """Number of intermediate hops (0 = direct)."""
+        return len(self.roi_path.intermediate_hashes)
+
+
+def _path_min_snr(payload: dict | None) -> float | None:
+    """Return the weakest per-hop SNR in a trace payload, or None if unavailable."""
+    if not payload:
+        return None
+    snrs = [
+        h.get("snr")
+        for h in payload.get("path", [])
+        if isinstance(h.get("snr"), (int, float))
+    ]
+    return min(snrs) if snrs else None
+
+
+def _path_avg_snr(payload: dict | None) -> float | None:
+    """Return the mean per-hop SNR in a trace payload, or None if unavailable."""
+    if not payload:
+        return None
+    snrs = [
+        h.get("snr")
+        for h in payload.get("path", [])
+        if isinstance(h.get("snr"), (int, float))
+    ]
+    return sum(snrs) / len(snrs) if snrs else None
+
+
+def _score_path(
+    min_snr: float | None,
+    avg_snr: float | None = None,
+    n_hops: int = 0,
+) -> tuple[float, float, int]:
+    """Sort key for ranking paths by stability (lower tuple = better).
+
+    Primary key is the weakest hop SNR (a chain is only as stable as its
+    weakest link), tie-broken by mean SNR, then by hop count. Hop count is
+    only a last-resort tiebreaker — paths are ranked by signal, not length.
+    ``None`` SNR values are treated as worst.
+    """
+    lo = min_snr if min_snr is not None else float("-inf")
+    avg = avg_snr if avg_snr is not None else float("-inf")
+    return (-lo, -avg, n_hops)
+
+
+def _path_sort_key(pr: "PathResult") -> tuple[float, float, int]:
+    """Ranking key for a :class:`PathResult`."""
+    return _score_path(pr.min_snr, pr.avg_snr, pr.n_hops)
+
+
+
+def _order_candidates(hashes: list[str], snr_map: dict[str, float | None]) -> list[str]:
+    """Order candidate hashes by descending known SNR (unknown SNR last)."""
+    def key(h: str) -> float:
+        v = snr_map.get(h)
+        return v if isinstance(v, (int, float)) else float("-inf")
+
+    return sorted(hashes, key=key, reverse=True)
+
+
+def _ordered_subsequences(items: list[str], max_len: int) -> list[list[str]]:
+    """All non-empty ordered subsequences of *items* with length ≤ *max_len*.
+
+    Ordering of the original list is preserved within each subsequence, and
+    longer subsequences come first (they use more of the known corridor).
+    Used to expand a ``--via`` corridor into concrete paths to test.
+    """
+    from itertools import combinations
+
+    result: list[list[str]] = []
+    n = len(items)
+    for length in range(min(n, max_len), 0, -1):
+        for combo in combinations(range(n), length):
+            result.append([items[i] for i in combo])
+    return result
+
+
+async def _trace_with_retries(
+    mc: MeshCore,
+    path_str: str,
+    timeout: float,
+    retries: int,
+    verbose: bool = False,
+) -> dict | None:
+    """Trace *path_str* up to *retries* times; return first successful payload."""
+    for attempt in range(1, max(1, retries) + 1):
+        if verbose and attempt > 1:
+            console.print(f"      [dim]retry {attempt}/{retries} …[/]")
+        trace = await _send_trace_and_wait(mc, path_str, timeout, verbose=verbose)
+        if trace:
+            return trace
+    return None
+
+
+async def _probe_reachability(
+    mc: MeshCore,
+    repeaters: list[dict],
+    timeout: float,
+    retries: int,
+    verbose: bool = False,
+    prefix: list[str] | None = None,
+) -> dict[str, float | None]:
+    """Trace each repeater (with retries); return {hash: best_min_snr}.
+
+    Only reachable repeaters appear in the result. The SNR value is used later
+    to prioritise which repeaters to try as intermediate hops.
+
+    If *prefix* is given, each repeater is probed *through* that fixed chain of
+    hops (``prefix → repeater``) instead of directly, so reachability is judged
+    from the far end of a known ``--via`` corridor rather than from the device.
+    """
+    prefix = prefix or []
+    reachable: dict[str, float | None] = {}
+    for r in repeaters:
+        h = _contact_hash(r)
+        name = r.get("adv_name", "?")
+        probe = RoiPath(roi_hash=h, intermediate_hashes=prefix, hash_len=1)
+        trace = await _trace_with_retries(
+            mc, probe.trace_to_roi(), timeout, retries, verbose=verbose
+        )
+        if trace:
+            reachable[h] = _path_min_snr(trace)
+            if verbose:
+                console.print(f"    [dim]{name} ({h}) — reachable[/]")
+        elif verbose:
+            console.print(f"    [dim]{name} ({h}) — not reachable[/]")
+    return reachable
+
+
+async def _bfs_find_all_paths(
+    mc: MeshCore,
+    roi_hash: str,
+    repeaters: list[dict],
+    timeout: float,
+    retries: int,
+    max_hops: int,
+    exhaustive: bool,
+    verbose: bool,
+    prefix: list[str] | None = None,
+    tried: set[tuple[str, ...]] | None = None,
+    hash_to_name_extra: dict[str, str] | None = None,
+) -> list[PathResult]:
+    """Thorough BFS: collect verified paths to the ROI, ordered by quality.
+
+    - Each trace is retried up to *retries* times.
+    - Reachable candidates (ordered by SNR) seed the first discovered hop.
+    - Deeper chains extend with SNR-ordered candidates.
+    - Without *exhaustive*, stops after the first depth that yields any path.
+    - With *exhaustive*, scans all depths up to *max_hops* and returns everything.
+
+    If *prefix* is given (a known ``--via`` corridor), every path is built as
+    ``prefix → discovered tail → target``: candidates are probed for reachability
+    *through* the corridor and *max_hops* counts the discovered tail hops beyond
+    it. This lets ``--via`` cross a known-good stretch cheaply and only discover
+    the unknown remainder.
+
+    *tried* is a shared set of full intermediate-chain tuples already probed; any
+    already in it is skipped (updated in place).
+    """
+    prefix = prefix or []
+    prefix_set = set(prefix)
+    tried = tried if tried is not None else set()
+    hash_to_name: dict[str, str] = {}
+    for r in repeaters:
+        hash_to_name[_contact_hash(r)] = r.get("adv_name", "?")
+    for h in prefix:
+        hash_to_name.setdefault(h, h)
+    if hash_to_name_extra:
+        hash_to_name.update(hash_to_name_extra)
+
+    # Candidates for discovered hops: exclude the corridor itself and the ROI.
+    candidates = [
+        r for r in repeaters
+        if _contact_hash(r) not in prefix_set and _contact_hash(r) != roi_hash
+    ]
+
+    if prefix:
+        prefix_route = " → ".join(hash_to_name.get(h, h) for h in prefix)
+        console.print(
+            f"  [bold]Discovering tail beyond {prefix_route} — probing "
+            f"{len(candidates)} candidate(s) reachable through the corridor …[/]"
+        )
+    else:
+        console.print(f"  [bold]Scanning reachability of {len(candidates)} repeater(s) …[/]")
+
+    snr_map = await _probe_reachability(
+        mc, candidates, timeout, retries, verbose=verbose, prefix=prefix,
+    )
+    where = "beyond the corridor" if prefix else "directly"
+    console.print(f"  {len(snr_map)} repeater(s) reachable {where}")
+    if not snr_map:
+        return []
+
+    cand_hashes = [_contact_hash(r) for r in candidates]
+    ordered_all = _order_candidates(cand_hashes, snr_map)
+    reachable_ordered = _order_candidates(list(snr_map.keys()), snr_map)
+
+    results: list[PathResult] = []
+    chains: list[list[str]] = []
+    for depth in range(1, max_hops + 1):
+        if depth == 1:
+            chains = [[h] for h in reachable_ordered]
+        else:
+            new_chains: list[list[str]] = []
+            for chain in chains:
+                for h in ordered_all:
+                    if h not in chain and h != roi_hash:
+                        new_chains.append(chain + [h])
+            chains = new_chains
+
+        # Build full paths (prefix + discovered tail) and skip any already tried.
+        pending: list[list[str]] = []
+        for chain in chains:
+            full = prefix + chain
+            if tuple(full) in tried:
+                continue
+            pending.append(chain)
+
+        if not pending:
+            continue
+
+        tier = f"tail-depth {depth}" if prefix else f"depth {depth}"
+        console.print(f"  Trying {len(pending)} path(s) at {tier} …")
+        for chain in pending:
+            full = prefix + chain
+            tried.add(tuple(full))
+            candidate = RoiPath(roi_hash=roi_hash, intermediate_hashes=full, hash_len=1)
+            names = [hash_to_name.get(h, h) for h in full]
+            if verbose:
+                console.print(f"    [dim]{' → '.join(names)} → target: {candidate.trace_to_roi()}[/]")
+            trace = await _trace_with_retries(
+                mc, candidate.trace_to_roi(), timeout, retries, verbose=verbose
+            )
+            if trace:
+                min_snr = _path_min_snr(trace)
+                avg_snr = _path_avg_snr(trace)
+                snr_disp = f"{min_snr:+.1f}" if min_snr is not None else "?"
+                avg_disp = f"{avg_snr:+.1f}" if avg_snr is not None else "?"
+                console.print(
+                    f"  [green]Reachable via {' → '.join(names)}[/] "
+                    f"({len(full)} hop(s), min SNR {snr_disp}, avg SNR {avg_disp})"
+                )
+                results.append(
+                    PathResult(roi_path=candidate, min_snr=min_snr, avg_snr=avg_snr, hop_names=names)
+                )
+
+        if results and not exhaustive:
+            break
+
+    results.sort(key=_path_sort_key)
+    return results
+
+
+async def _corridor_find_paths(
+    mc: MeshCore,
+    roi_hash: str,
+    waypoints: list[str],
+    hash_to_name: dict[str, str],
+    timeout: float,
+    retries: int,
+    max_hops: int,
+    verbose: bool,
+    tried: set[tuple[str, ...]] | None = None,
+) -> list[PathResult]:
+    """Test an *ordered* ``--via`` corridor without probing the whole mesh.
+
+    Given an ordered list of waypoint hashes (e.g. ``[55, b0, e5]``), trace the
+    full corridor ``me → 55 → b0 → e5 → target`` and every ordered subsequence
+    of it (``55→b0``, ``b0→e5``, ``55→e5``, …). All are verified with retries
+    and scored by SNR stability, so a shorter subpath that avoids a weak hop can
+    win over the full corridor.
+
+    *tried* is a shared set of chains already probed by previous corridors; any
+    subsequence in it is skipped so overlapping corridors never re-trace the
+    same (sub)path. It is updated in place with every chain attempted here.
+
+    This leverages the operator's knowledge of the route order to test only a
+    handful of concrete paths instead of scanning every repeater.
+    """
+    if tried is None:
+        tried = set()
+    subseqs = _ordered_subsequences(waypoints, max_hops)
+    corridor_names = " → ".join(hash_to_name.get(h, h) for h in waypoints)
+    console.print(
+        f"  [bold]Testing ordered corridor[/] {corridor_names} → target "
+        f"([cyan]{len(subseqs)}[/] ordered path(s), longest first) …"
+    )
+
+    results: list[PathResult] = []
+    for chain in subseqs:
+        key = tuple(chain)
+        if key in tried:
+            if verbose:
+                route = " → ".join(hash_to_name.get(h, h) for h in chain) or "direct"
+                console.print(f"    [dim]{route} → target: already probed, skipping[/]")
+            continue
+        tried.add(key)
+
+        candidate = RoiPath(roi_hash=roi_hash, intermediate_hashes=chain, hash_len=1)
+        names = [hash_to_name.get(h, h) for h in chain]
+        route = " → ".join(names) if names else "direct"
+        if verbose:
+            console.print(f"    [dim]{route} → target: {candidate.trace_to_roi()}[/]")
+        trace = await _trace_with_retries(
+            mc, candidate.trace_to_roi(), timeout, retries, verbose=verbose
+        )
+        if trace:
+            min_snr = _path_min_snr(trace)
+            avg_snr = _path_avg_snr(trace)
+            snr_disp = f"{min_snr:+.1f}" if min_snr is not None else "?"
+            avg_disp = f"{avg_snr:+.1f}" if avg_snr is not None else "?"
+            console.print(
+                f"  [green]Reachable via {route}[/] "
+                f"({len(chain)} hop(s), min SNR {snr_disp}, avg SNR {avg_disp})"
+            )
+            results.append(
+                PathResult(roi_path=candidate, min_snr=min_snr, avg_snr=avg_snr, hop_names=names)
+            )
+
+    results.sort(key=_path_sort_key)
+    return results
+
+
+async def find_path_thorough(
+    mc: MeshCore,
+    roi: dict,
+    cfg: dict[str, Any],
+    others: list[dict],
+    timeout: float,
+    verbose: bool,
+    exhaustive: bool = False,
+    corridors: list[list[str]] | None = None,
+) -> list[PathResult]:
+    """Extensively search for working paths to *roi*.
+
+    Order of attempts:
+      1. Direct trace (with retries).
+      2. Protocol path discovery (reset → flood → discover → verify).
+      3. Thorough BFS through known repeaters (SNR-ordered, retried).
+
+    If *corridors* is given (one or more ordered ``--via`` routes), the
+    mesh-wide search is skipped. For each corridor findpath first tests the
+    corridor and its ordered subsequences directly (see
+    :func:`_corridor_find_paths`), then — anchored at the corridor's far end —
+    discovers any unknown tail hops needed to reach the ROI (see
+    :func:`_bfs_find_all_paths` with a ``prefix``). All results are merged and
+    ranked by stability.
+
+    Returns a list of verified :class:`PathResult`, ranked most-stable first.
+    Empty if the target repeater is unreachable.
+    """
+    retries: int = cfg.get("flood_retries", 1)
+    max_hops: int = cfg.get("max_path_hops", 4)
+    route_list = corridors or []
+    name = roi.get("adv_name", "?")
+    roi_hash = _contact_hash(roi)
+    console.print(
+        f"\n[bold]Finding path to target repeater [cyan]{name}[/] "
+        f"(hash [dim]{roi_hash}[/]) …[/]"
+    )
+
+    # Ordered corridor mode — use the known route(s), then discover the tail.
+    if route_list:
+        hash_to_name = {_contact_hash(r): r.get("adv_name", "?") for r in others}
+        for corridor in route_list:
+            for h in corridor:
+                hash_to_name.setdefault(h, h)
+        plural = "s" if len(route_list) > 1 else ""
+        console.print(
+            f"  [dim]{len(route_list)} corridor{plural} set — testing each route + "
+            f"subsequences, then discovering unknown tail hops beyond the corridor. "
+            f"Skipping direct/protocol discovery and mesh-wide scan.[/]"
+        )
+        results: list[PathResult] = []
+        tried: set[tuple[str, ...]] = set()
+
+        def _merge(found: list[PathResult]) -> None:
+            for pr in found:
+                if not any(existing.roi_path.intermediate_hashes == pr.roi_path.intermediate_hashes
+                           for existing in results):
+                    results.append(pr)
+
+        # Phase 1 — test each corridor and its ordered subsequences directly.
+        # This is cheap and catches the case where the ROI hangs directly off a
+        # known waypoint.
+        for idx, corridor in enumerate(route_list, 1):
+            if len(route_list) > 1:
+                route_disp = " → ".join(hash_to_name.get(h, h) for h in corridor)
+                console.print(f"  [bold]Corridor {idx}/{len(route_list)}:[/] {route_disp}")
+            _merge(await _corridor_find_paths(
+                mc, roi_hash, corridor, hash_to_name, timeout, retries,
+                max_hops, verbose, tried=tried,
+            ))
+
+        # Phase 2 — if the known routes didn't reach the ROI (or --exhaustive),
+        # discover the unknown tail anchored at each corridor's far end, so we
+        # don't re-scan the known crossing. Candidates for the tail are scoped
+        # by the `tail_candidates` spec (names / hashes / name-prefixes); if it
+        # is empty the full pool is used.
+        if exhaustive or not results:
+            tail_spec: str = cfg.get("tail_candidates", "")
+            tail_pool = _select_tail_candidates(others, tail_spec)
+            if tail_spec:
+                console.print(
+                    f"  [dim]Tail discovery scoped to [green]{len(tail_pool)}[/] "
+                    f"repeater(s) matching: {tail_spec}[/]"
+                )
+                if not tail_pool:
+                    console.print(
+                        "  [yellow]No repeaters matched the tail-candidate spec — "
+                        "nothing to discover beyond the corridor.[/]"
+                    )
+            for idx, corridor in enumerate(route_list, 1):
+                route_disp = " → ".join(hash_to_name.get(h, h) for h in corridor)
+                console.print(
+                    f"  [bold]Discovering tail beyond corridor {idx}/{len(route_list)}:[/] "
+                    f"{route_disp} → ?"
+                )
+                _merge(await _bfs_find_all_paths(
+                    mc, roi_hash, tail_pool, timeout, retries, max_hops,
+                    exhaustive, verbose,
+                    prefix=corridor, tried=tried, hash_to_name_extra=hash_to_name,
+                ))
+
+        results.sort(key=_path_sort_key)
+        return results
+
+    results: list[PathResult] = []
+
+    # 1. Direct trace
+    console.print("  Trying direct trace …")
+    direct = RoiPath(roi_hash=roi_hash, intermediate_hashes=[], hash_len=1)
+    trace = await _trace_with_retries(mc, direct.trace_to_roi(), timeout, retries, verbose=verbose)
+    if trace:
+        min_snr = _path_min_snr(trace)
+        avg_snr = _path_avg_snr(trace)
+        snr_disp = f"{min_snr:+.1f}" if min_snr is not None else "?"
+        console.print(f"  [green]Directly reachable[/] (min SNR {snr_disp})")
+        results.append(PathResult(roi_path=direct, min_snr=min_snr, avg_snr=avg_snr, hop_names=[]))
+        if not exhaustive:
+            return results
+
+    # 2. Protocol path discovery
+    console.print("  Trying protocol path discovery …")
+    discovered = await establish_path_to_roi(
+        mc, roi, timeout, other_repeaters=None, verbose=verbose
+    )
+    if discovered is not None and discovered.intermediate_hashes:
+        # Verify quality with a fresh trace so we can score it
+        vtrace = await _trace_with_retries(
+            mc, discovered.trace_to_roi(), timeout, retries, verbose=verbose
+        )
+        min_snr = _path_min_snr(vtrace)
+        avg_snr = _path_avg_snr(vtrace)
+        names = list(discovered.intermediate_hashes)
+        if not any(pr.roi_path.intermediate_hashes == discovered.intermediate_hashes
+                   for pr in results):
+            results.append(
+                PathResult(roi_path=discovered, min_snr=min_snr, avg_snr=avg_snr, hop_names=names)
+            )
+        if results and not exhaustive:
+            results.sort(key=_path_sort_key)
+            return results
+
+    # 3. Thorough BFS through known repeaters
+    if others:
+        bfs_results = await _bfs_find_all_paths(
+            mc, roi_hash, others, timeout, retries, max_hops, exhaustive, verbose,
+        )
+        for pr in bfs_results:
+            if not any(existing.roi_path.intermediate_hashes == pr.roi_path.intermediate_hashes
+                       for existing in results):
+                results.append(pr)
+    elif not results:
+        console.print("  [red]No other repeaters to try as intermediate hops.[/]")
+
+    results.sort(key=_path_sort_key)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Step 3 — Discover zero-hop neighbours of the ROI
 # ---------------------------------------------------------------------------
 
@@ -772,6 +1342,67 @@ async def run_scan(mc: MeshCore, cfg: dict[str, Any]) -> list[NeighbourStats]:
     if not neighbours:
         return []
     return await _measure_with_neighbours(mc, cfg, neighbours)
+
+
+async def run_findpath(
+    mc: MeshCore,
+    cfg: dict[str, Any],
+    exhaustive: bool = False,
+) -> list[PathResult]:
+    """Orchestrate a thorough search for a path to the target repeater.
+
+    Returns the verified paths (best first). Prints diagnostics along the way.
+    """
+    roi_name: str = cfg["repeater_of_interest"]
+    timeout: float = cfg["trace_timeout"]
+    verbose: bool = cfg.get("verbose", False)
+    prefix: str = cfg.get("repeater_prefix", "")
+    exclude: str = cfg.get("exclude_repeaters", "")
+    candidates: str = cfg.get("path_candidates", "")
+
+    console.print("\n[bold]Fetching repeaters …[/]")
+    repeaters = await get_repeaters(mc)
+    if not repeaters:
+        console.print("[red]No repeaters found.[/]")
+        return []
+
+    roi = _find_roi(repeaters, roi_name)
+    if roi is None:
+        console.print(f"[red]Target repeater '{roi_name}' not found in contacts.[/]")
+        return []
+
+    others = [r for r in repeaters if r is not roi]
+    others = _filter_repeaters(others, prefix, exclude)
+
+    corridors: list[list[str]] = []
+    if candidates:
+        n_requested = len([c for c in candidates.split(";") if c.strip()])
+        corridors = _parse_corridors(candidates, others)
+        hash_to_name = {_contact_hash(r): r.get("adv_name", "?") for r in others}
+        if corridors:
+            plural = "s" if len(corridors) > 1 else ""
+            console.print(
+                f"  Corridor mode: testing [green]{len(corridors)}[/] of "
+                f"[cyan]{n_requested}[/] requested ordered route{plural} "
+                f"(and their ordered subsequences):"
+            )
+            for idx, corridor in enumerate(corridors, 1):
+                route_disp = " → ".join(hash_to_name.get(h, h) for h in corridor)
+                console.print(f"    [cyan]{idx}.[/] {route_disp} → target")
+        if not corridors:
+            console.print(
+                "[red]None of the requested waypoint repeaters were found "
+                "in contacts — aborting.[/]"
+            )
+            return []
+
+    results = await find_path_thorough(
+        mc, roi, cfg, others, timeout, verbose,
+        exhaustive=exhaustive, corridors=corridors,
+    )
+    if not results:
+        console.print("\n[red]No working path to the target repeater was found.[/]")
+    return results
 
 
 async def run_measure(

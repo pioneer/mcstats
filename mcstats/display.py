@@ -3,7 +3,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.table import Table
 
-from .scanner import NeighbourStats, SnrSample, _contact_hash
+from .scanner import NeighbourStats, PathResult, SnrSample, _contact_hash
 
 console = Console()
 
@@ -122,3 +122,57 @@ def show_repeaters(repeaters: list[dict]) -> None:
 
     console.print()
     console.print(table)
+
+
+def show_path_results(
+    results: list[PathResult],
+    roi_name: str = "",
+    roi_hash: str = "",
+) -> None:
+    """Render a ranked table of verified paths to the target repeater."""
+    if not results:
+        console.print("[yellow]No working paths found.[/]")
+        return
+
+    if roi_name:
+        label = f"{roi_name} ({roi_hash})" if roi_hash else roi_name
+        title = f"Paths to Target Repeater: {label}"
+    else:
+        title = "Paths to Target Repeater"
+
+    table = Table(title=title, show_lines=True, title_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Hops", justify="right")
+    table.add_column("Route", style="cyan")
+    table.add_column("Min SNR", justify="right", style="bold")
+    table.add_column("Avg SNR", justify="right")
+    table.add_column("Config value", style="dim")
+
+    for idx, pr in enumerate(results, 1):
+        route = "direct" if not pr.hop_names else " → ".join(pr.hop_names)
+        min_snr = _color_avg(pr.min_snr) if pr.min_snr is not None else "?"
+        avg_snr = _fmt_avg(pr.avg_snr) if pr.avg_snr is not None else "?"
+        config_val = "direct" if not pr.roi_path.intermediate_hashes else pr.roi_path.prefix
+        style = "bold green" if idx == 1 else None
+        table.add_row(
+            str(idx),
+            str(pr.n_hops),
+            route,
+            min_snr,
+            avg_snr,
+            config_val,
+            style=style,
+        )
+
+    console.print()
+    console.print(table)
+    console.print(
+        "\n  [dim]Ranked by stability: weakest-hop SNR first, then average SNR.[/]"
+    )
+
+    best = results[0]
+    best_val = "direct" if not best.roi_path.intermediate_hashes else best.roi_path.prefix
+    console.print(
+        f"\n  [bold]Best path:[/] set "
+        f"[cyan]repeater_of_interest_path: \"{best_val}\"[/] in config.yaml"
+    )
