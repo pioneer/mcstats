@@ -53,10 +53,24 @@ class RoiPath:
     intermediate_hashes: list[str]   # hashes of hops between client and ROI
     hash_len: int = 1                # bytes per hash
 
+    @staticmethod
+    def _dedup(hops: list[str]) -> list[str]:
+        """Collapse consecutive duplicate hops (e.g. when a hop equals the ROI)."""
+        result: list[str] = []
+        for h in hops:
+            if not result or result[-1] != h:
+                result.append(h)
+        return result
+
     @property
     def prefix(self) -> str:
         """Comma-separated intermediate hops (empty string if direct)."""
         return ",".join(self.intermediate_hashes) if self.intermediate_hashes else ""
+
+    @property
+    def hops_to_roi_len(self) -> int:
+        """Number of hops (deduped) in the forward path up to and including the ROI."""
+        return len(self._dedup(self.intermediate_hashes + [self.roi_hash]))
 
     def trace_to(self, target_hash: str) -> str:
         """Build trace path: [intermediates..., ROI, target, ROI, ...intermediates_reversed].
@@ -65,7 +79,7 @@ class RoiPath:
         """
         fwd = self.intermediate_hashes + [self.roi_hash, target_hash]
         ret = [self.roi_hash] + list(reversed(self.intermediate_hashes))
-        return ",".join(fwd + ret)
+        return ",".join(self._dedup(fwd + ret))
 
     def trace_roundtrip(self, target_hash: str) -> str:
         """Alias for trace_to — all traces are round-trips."""
@@ -75,7 +89,7 @@ class RoiPath:
         """Build trace path to ROI and back: [intermediates..., ROI, ...intermediates_reversed]."""
         fwd = self.intermediate_hashes + [self.roi_hash]
         ret = list(reversed(self.intermediate_hashes))
-        return ",".join(fwd + ret) if ret else ",".join(fwd)
+        return ",".join(self._dedup(fwd + ret))
 
 
 # ---------------------------------------------------------------------------
@@ -513,11 +527,10 @@ async def discover_neighbours(
     of the ROI — because no extra hops between ROI and candidate.
     """
     neighbours: list[dict] = []
-    n_intermediates = len(roi_path.intermediate_hashes)
     # In the round-trip trace hops:
     #   [int0, int1, ..., ROI, N, ROI, ..., int1, int0, (client)]
-    nbr_hop_idx = n_intermediates + 1     # outbound SNR (ROI → N)
-    roi_return_idx = n_intermediates + 2   # inbound SNR (N → ROI)
+    nbr_hop_idx = roi_path.hops_to_roi_len       # outbound SNR (ROI → N)
+    roi_return_idx = roi_path.hops_to_roi_len + 1  # inbound SNR (N → ROI)
 
     for cand in candidates:
         cand_hash = _contact_hash(cand, roi_path.hash_len)
@@ -586,14 +599,13 @@ async def gather_snr(
     Both are extracted from a single trace.
     """
     all_stats: list[NeighbourStats] = []
-    n_intermediates = len(roi_path.intermediate_hashes)
 
     # In the round-trip trace result hops:
     #   [int0, int1, ..., ROI, N, ROI, ..., int1, int0, (client)]
-    # Outbound SNR at N:         index = n_intermediates + 1
-    # Inbound SNR at ROI return: index = n_intermediates + 2
-    nbr_hop_idx = n_intermediates + 1
-    roi_return_idx = n_intermediates + 2
+    # Outbound SNR at N:         index = hops_to_roi_len
+    # Inbound SNR at ROI return: index = hops_to_roi_len + 1
+    nbr_hop_idx = roi_path.hops_to_roi_len
+    roi_return_idx = roi_path.hops_to_roi_len + 1
 
     for nbr in neighbours:
         nbr_hash = _contact_hash(nbr, roi_path.hash_len)
@@ -642,6 +654,46 @@ async def gather_snr(
     return all_stats
 
 
+async def _resolve_roi_path(
+    mc: MeshCore,
+    roi: dict,
+    roi_hash: str,
+    cfg: dict[str, Any],
+    others: list[dict],
+    timeout: float,
+    verbose: bool,
+) -> RoiPath | None:
+    """Resolve the RoiPath to use: configured (verified with retries) or auto-discovered.
+
+    A manually configured path is only a guess, so it is verified with up to
+    *flood_retries* trace attempts. If none succeed, the manual path is
+    rejected and we fall back to auto-discovery.
+    """
+    manual_path = cfg.get("repeater_of_interest_path", "")
+    retries: int = cfg.get("flood_retries", 1)
+    roi_path = _roi_path_from_config(roi_hash, manual_path)
+
+    if roi_path:
+        console.print(
+            f"\n[bold]Using configured path to target repeater:[/] "
+            f"{'direct' if not roi_path.intermediate_hashes else ','.join(roi_path.intermediate_hashes)}"
+        )
+        for attempt in range(1, retries + 1):
+            if verbose and attempt > 1:
+                console.print(f"    [dim]verify retry {attempt}/{retries} …[/]")
+            trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
+            if trace:
+                console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
+                return roi_path
+
+        console.print(
+            f"  [red]Configured path did not respond after {retries} attempt(s) — "
+            f"falling back to auto-discovery.[/]"
+        )
+
+    return await establish_path_to_roi(mc, roi, timeout, other_repeaters=others, verbose=verbose)
+
+
 # ---------------------------------------------------------------------------
 # Orchestrators
 # ---------------------------------------------------------------------------
@@ -665,30 +717,18 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
         console.print(f"    {r.get('adv_name', '?')} [dim]({h})[/]")
     console.print(f"  Found [green]{len(repeaters)}[/] repeater(s)")
 
-    # Identify ROI
+    # Identify target repeater
     roi = _find_roi(repeaters, roi_name)
     if roi is None:
-        console.print(f"[red]ROI '{roi_name}' not found in contacts.[/]")
+        console.print(f"[red]Target repeater '{roi_name}' not found in contacts.[/]")
         return []
 
-    # 2. Establish path to ROI
+    # 2. Establish path to target repeater
     others = [r for r in repeaters if r is not roi]
-    manual_path = cfg.get("repeater_of_interest_path", "")
     roi_hash = _contact_hash(roi)
-    roi_path = _roi_path_from_config(roi_hash, manual_path)
-    if roi_path:
-        console.print(f"\n[bold]Using configured path to ROI:[/] "
-                       f"{'direct' if not roi_path.intermediate_hashes else ','.join(roi_path.intermediate_hashes)}")
-        # Verify with a quick trace
-        trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
-        if trace:
-            console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
-        else:
-            console.print("  [yellow]Configured path did not respond — continuing anyway.[/]")
-    else:
-        roi_path = await establish_path_to_roi(mc, roi, timeout, other_repeaters=others, verbose=verbose)
+    roi_path = await _resolve_roi_path(mc, roi, roi_hash, cfg, others, timeout, verbose)
     if roi_path is None:
-        console.print("[red]Cannot reach ROI — aborting.[/]")
+        console.print("[red]Cannot reach target repeater — aborting.[/]")
         return []
 
     # Sync the firmware's contact table so binary requests can route
@@ -782,25 +822,14 @@ async def _measure_with_neighbours(
     repeaters = await get_repeaters(mc)
     roi = _find_roi(repeaters, roi_name)
     if roi is None:
-        console.print(f"[red]ROI '{roi_name}' not found.[/]")
+        console.print(f"[red]Target repeater '{roi_name}' not found.[/]")
         return []
 
     others = [r for r in repeaters if r is not roi]
-    manual_path = cfg.get("repeater_of_interest_path", "")
     roi_hash = _contact_hash(roi)
-    roi_path = _roi_path_from_config(roi_hash, manual_path)
-    if roi_path:
-        console.print(f"\n[bold]Using configured path to ROI:[/] "
-                       f"{'direct' if not roi_path.intermediate_hashes else ','.join(roi_path.intermediate_hashes)}")
-        trace = await _send_trace_and_wait(mc, roi_path.trace_to_roi(), timeout, verbose=verbose)
-        if trace:
-            console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
-        else:
-            console.print("  [yellow]Configured path did not respond — continuing anyway.[/]")
-    else:
-        roi_path = await establish_path_to_roi(mc, roi, timeout, other_repeaters=others, verbose=verbose)
+    roi_path = await _resolve_roi_path(mc, roi, roi_hash, cfg, others, timeout, verbose)
     if roi_path is None:
-        console.print("[red]Cannot reach ROI.[/]")
+        console.print("[red]Cannot reach target repeater.[/]")
         return []
 
     await _sync_firmware_path(mc, roi, roi_path, verbose=verbose)

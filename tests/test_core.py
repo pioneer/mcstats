@@ -56,6 +56,17 @@ class TestRoiPath:
         rp = RoiPath(roi_hash="e5", intermediate_hashes=["55", "b0"], hash_len=1)
         assert rp.trace_to_roi() == "55,b0,e5,b0,55"
 
+    def test_trace_to_roi_hash_equals_last_hop(self):
+        # ROI hash 55 with path "55" — no redundant repeated 55
+        rp = RoiPath(roi_hash="55", intermediate_hashes=["55"], hash_len=1)
+        assert rp.trace_to("b3") == "55,b3,55"
+        assert rp.trace_to_roi() == "55"
+
+    def test_hops_to_roi_len(self):
+        assert RoiPath("e5", []).hops_to_roi_len == 1
+        assert RoiPath("e5", ["55", "b0"]).hops_to_roi_len == 3
+        assert RoiPath("55", ["55"]).hops_to_roi_len == 1
+
 
 # ---------------------------------------------------------------------------
 # SnrSample / NeighbourStats
