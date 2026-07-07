@@ -47,7 +47,7 @@ def show_stats(stats: list[NeighbourStats], penalty: float, roi_name: str = "", 
 
     if roi_name:
         label = f"{roi_name} ({roi_hash})" if roi_hash else roi_name
-        title = f"SNR Report \u2014 ROI: {label}"
+        title = f"SNR Report \u2014 Target Repeater: {label}"
     else:
         title = "Repeater Neighbour SNR Report"
     table = Table(

@@ -52,7 +52,7 @@ def list_repeaters(c, config="config.yaml", verbose=False, prefix=None, exclude=
     },
 )
 def discover(c, roi=None, config="config.yaml", verbose=False, prefix=None, exclude=None):
-    """Discover zero-hop neighbours of the ROI and save to cache."""
+    """Discover zero-hop neighbours of the target repeater and save to cache."""
 
     async def _inner():
         from mcstats.config import load_config
@@ -91,7 +91,7 @@ def discover(c, roi=None, config="config.yaml", verbose=False, prefix=None, excl
     },
 )
 def scan(c, roi=None, samples=None, config="config.yaml", verbose=False, prefix=None, exclude=None, csv=None):
-    """Full scan: discover neighbours of the ROI, gather SNR."""
+    """Full scan: discover neighbours of the target repeater, gather SNR."""
 
     async def _inner():
         from mcstats.config import load_config

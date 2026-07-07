@@ -230,7 +230,7 @@ async def fetch_roi_neighbours(
     local contact list.
     """
     name = roi.get("adv_name", "?")
-    console.print(f"\n[bold]Fetching neighbour list from ROI [cyan]{name}[/] …[/]")
+    console.print(f"\n[bold]Fetching neighbour list from target repeater [cyan]{name}[/] …[/]")
     try:
         result = await mc.commands.req_neighbours_sync(roi, timeout=timeout)
     except Exception as exc:
@@ -238,11 +238,11 @@ async def fetch_roi_neighbours(
         return []
 
     if result is None:
-        console.print("  [yellow]No response from ROI.[/]")
+        console.print("  [yellow]No response from target repeater.[/]")
         return []
 
     neighbours = result.get("neighbours", [])
-    console.print(f"  ROI reports [green]{result.get('neighbours_count', '?')}[/] neighbour(s), "
+    console.print(f"  Target repeater reports [green]{result.get('neighbours_count', '?')}[/] neighbour(s), "
                   f"received [green]{len(neighbours)}[/]")
 
     remote_contacts: list[dict] = []
@@ -306,7 +306,7 @@ async def establish_path_to_roi(
     """
     name = roi.get("adv_name", "?")
     roi_hash_1b = _contact_hash(roi)
-    console.print(f"\n[bold]Establishing path to ROI [cyan]{name}[/] (hash [dim]{roi_hash_1b}[/]) …[/]")
+    console.print(f"\n[bold]Establishing path to target repeater [cyan]{name}[/] (hash [dim]{roi_hash_1b}[/]) …[/]")
 
     # 1. Try direct trace first
     direct_path = RoiPath(roi_hash=roi_hash_1b, intermediate_hashes=[], hash_len=1)
@@ -318,7 +318,7 @@ async def establish_path_to_roi(
             f"{h.get('snr'):+.1f}" if isinstance(h.get("snr"), (int, float)) else "?"
             for h in path_data
         ]
-        console.print(f"  [green]ROI reachable directly.[/] SNR per hop: {' → '.join(snr_strs)}")
+        console.print(f"  [green]Target repeater reachable directly.[/] SNR per hop: {' → '.join(snr_strs)}")
         return direct_path
 
     console.print("  [yellow]Direct trace failed — running path discovery …[/]")
@@ -336,7 +336,7 @@ async def establish_path_to_roi(
 
     console.print("  Discovering path …")
     if verbose:
-        console.print(f"    [dim]ROI contact: {roi}[/]")
+        console.print(f"    [dim]Target repeater contact: {roi}[/]")
     res = await mc.commands.send_path_discovery(roi)
     if verbose:
         console.print(f"    [dim]send_path_discovery → type={res.type} payload={res.payload}[/]")
@@ -364,7 +364,7 @@ async def establish_path_to_roi(
 
     # 3. BFS: try multi-hop paths through known repeaters
     if not other_repeaters:
-        console.print("  [red]ROI is unreachable (no other repeaters to try).[/]")
+        console.print("  [red]Target repeater is unreachable (no other repeaters to try).[/]")
         return None
 
     result = await _bfs_find_path(
@@ -373,7 +373,7 @@ async def establish_path_to_roi(
     if result:
         return result
 
-    console.print("  [red]ROI is unreachable.[/]")
+    console.print("  [red]Target repeater is unreachable.[/]")
     return None
 
 
@@ -425,7 +425,7 @@ async def _apply_discovered_path(
         console.print(f"  [green]Path verified.[/] SNR per hop: {_format_snr_hops(trace.get('path', []))}")
         return roi_path
     else:
-        console.print("  [red]Trace to ROI failed — path not working.[/]")
+        console.print("  [red]Trace to target repeater failed — path not working.[/]")
         return None
 
 
@@ -496,12 +496,12 @@ async def _bfs_find_path(
             trace_str = candidate.trace_to_roi()
             if verbose:
                 path_names = " → ".join(hash_to_name.get(h, h) for h in chain)
-                console.print(f"    [dim]{path_names} → ROI: {trace_str}[/]")
+                console.print(f"    [dim]{path_names} → target repeater: {trace_str}[/]")
             trace = await _send_trace_and_wait(mc, trace_str, timeout, verbose=verbose)
             if trace:
                 path_names = " → ".join(hash_to_name.get(h, h) for h in chain)
                 console.print(
-                    f"  [green]ROI reachable via {path_names}[/] "
+                    f"  [green]Target repeater reachable via {path_names}[/] "
                     f"({depth} hop(s)). SNR: {_format_snr_hops(trace.get('path', []))}"
                 )
                 return candidate
@@ -537,7 +537,7 @@ async def discover_neighbours(
         name = cand.get("adv_name", "?")
         name_h = f"{name} ({cand_hash})"
         trace_path = roi_path.trace_to(cand_hash)
-        console.print(f"  Tracing [cyan]{name_h}[/] via ROI  path=[dim]{trace_path}[/]")
+        console.print(f"  Tracing [cyan]{name_h}[/] via target repeater  path=[dim]{trace_path}[/]")
 
         found = False
         for attempt in range(1, retries + 1):
@@ -752,7 +752,7 @@ async def run_discover(mc: MeshCore, cfg: dict[str, Any]) -> list[dict]:
         candidates.extend(new_remote)
 
     # 4. Discover zero-hop neighbours
-    console.print(f"\n[bold]Discovering neighbours of ROI via {len(candidates)} candidate(s) …[/]")
+    console.print(f"\n[bold]Discovering neighbours of target repeater via {len(candidates)} candidate(s) …[/]")
     neighbours = await discover_neighbours(mc, roi_path, candidates, retries, timeout, verbose=verbose)
     if not neighbours:
         console.print("[red]No zero-hop neighbours found.[/]")
