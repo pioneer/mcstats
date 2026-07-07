@@ -14,7 +14,15 @@ from mcstats.scanner import (
     _contact_hash,
     _filter_repeaters,
     _find_roi,
+    _order_candidates,
+    _ordered_subsequences,
+    _parse_corridors,
+    _path_avg_snr,
+    _path_min_snr,
     _roi_path_from_config,
+    _score_path,
+    _select_candidates,
+    _select_tail_candidates,
     _split_path_hashes,
 )
 from mcstats.config import DEFAULTS, load_config
@@ -156,6 +164,81 @@ class TestRoiPathFromConfig:
         assert rp.intermediate_hashes == ["55", "b0"]
 
 
+class TestPathFinding:
+    def test_path_min_snr_basic(self):
+        payload = {"path": [{"snr": 5.0}, {"snr": -2.0}, {"snr": 3.0}]}
+        assert _path_min_snr(payload) == pytest.approx(-2.0)
+
+    def test_path_min_snr_ignores_non_numeric(self):
+        payload = {"path": [{"snr": 4.0}, {"snr": None}, {}]}
+        assert _path_min_snr(payload) == pytest.approx(4.0)
+
+    def test_path_min_snr_empty(self):
+        assert _path_min_snr({"path": []}) is None
+        assert _path_min_snr(None) is None
+
+    def test_path_avg_snr_basic(self):
+        payload = {"path": [{"snr": 6.0}, {"snr": -2.0}, {"snr": 2.0}]}
+        assert _path_avg_snr(payload) == pytest.approx(2.0)
+
+    def test_path_avg_snr_ignores_non_numeric(self):
+        payload = {"path": [{"snr": 4.0}, {"snr": None}, {}]}
+        assert _path_avg_snr(payload) == pytest.approx(4.0)
+
+    def test_path_avg_snr_empty(self):
+        assert _path_avg_snr({"path": []}) is None
+        assert _path_avg_snr(None) is None
+
+    def test_score_path_stability_beats_hops(self):
+        # A more-stable path ranks better even with more hops
+        assert _score_path(8.0, 8.0, 3) < _score_path(2.0, 2.0, 1)
+
+    def test_score_path_higher_min_snr_wins(self):
+        # Higher weakest-hop SNR ranks better regardless of avg
+        assert _score_path(8.0, 8.0) < _score_path(3.0, 20.0)
+
+    def test_score_path_avg_breaks_min_tie(self):
+        # Equal min SNR → higher average wins
+        assert _score_path(5.0, 9.0) < _score_path(5.0, 6.0)
+
+    def test_score_path_hops_last_tiebreak(self):
+        # Equal min and avg → fewer hops wins
+        assert _score_path(5.0, 5.0, 1) < _score_path(5.0, 5.0, 3)
+
+    def test_score_path_none_snr_is_worst(self):
+        assert _score_path(None, None) > _score_path(-100.0, -100.0)
+
+    def test_order_candidates_descending_snr(self):
+        snr_map = {"aa": 3.0, "bb": 9.0, "cc": -1.0}
+        assert _order_candidates(["aa", "bb", "cc"], snr_map) == ["bb", "aa", "cc"]
+
+    def test_order_candidates_unknown_last(self):
+        snr_map = {"aa": 3.0, "bb": None}
+        assert _order_candidates(["bb", "aa", "dd"], snr_map)[0] == "aa"
+        # bb (None) and dd (missing) both sort to the end
+        assert set(_order_candidates(["bb", "aa", "dd"], snr_map)[1:]) == {"bb", "dd"}
+
+    def test_ordered_subsequences_longest_first(self):
+        seqs = _ordered_subsequences(["a", "b", "c"], max_len=3)
+        # Longest first, order preserved within each subsequence
+        assert seqs[0] == ["a", "b", "c"]
+        assert ["a", "b"] in seqs and ["a", "c"] in seqs and ["b", "c"] in seqs
+        assert ["a"] in seqs and ["b"] in seqs and ["c"] in seqs
+        # 2^3 - 1 = 7 non-empty subsequences
+        assert len(seqs) == 7
+        # Every subsequence preserves the original relative order
+        for s in seqs:
+            idxs = [["a", "b", "c"].index(x) for x in s]
+            assert idxs == sorted(idxs)
+
+    def test_ordered_subsequences_respects_max_len(self):
+        seqs = _ordered_subsequences(["a", "b", "c"], max_len=1)
+        assert seqs == [["a"], ["b"], ["c"]]
+
+    def test_ordered_subsequences_empty(self):
+        assert _ordered_subsequences([], max_len=3) == []
+
+
 class TestFilterRepeaters:
     def _repeaters(self):
         return [
@@ -183,6 +266,118 @@ class TestFilterRepeaters:
         assert result[0]["adv_name"] == "Kyiv_R1"
 
 
+class TestSelectCandidates:
+    def _repeaters(self):
+        return [
+            {"adv_name": "Kyiv_R1", "public_key": "aa11"},
+            {"adv_name": "Kyiv_R2", "public_key": "bb22"},
+            {"adv_name": "Lviv_R1", "public_key": "cc33"},
+        ]
+
+    def test_empty_keeps_all(self):
+        assert len(_select_candidates(self._repeaters(), "")) == 3
+
+    def test_by_name(self):
+        result = _select_candidates(self._repeaters(), "Kyiv_R1,Lviv_R1")
+        assert [r["adv_name"] for r in result] == ["Kyiv_R1", "Lviv_R1"]
+
+    def test_by_hex_hash(self):
+        result = _select_candidates(self._repeaters(), "bb")
+        assert len(result) == 1
+        assert result[0]["adv_name"] == "Kyiv_R2"
+
+    def test_preserves_allowlist_order(self):
+        result = _select_candidates(self._repeaters(), "Lviv_R1,Kyiv_R1")
+        assert [r["adv_name"] for r in result] == ["Lviv_R1", "Kyiv_R1"]
+
+    def test_ignores_unknown(self):
+        result = _select_candidates(self._repeaters(), "Kyiv_R1,Nonexistent")
+        assert [r["adv_name"] for r in result] == ["Kyiv_R1"]
+
+    def test_dedups(self):
+        result = _select_candidates(self._repeaters(), "Kyiv_R1,aa,Kyiv_R1")
+        assert [r["adv_name"] for r in result] == ["Kyiv_R1"]
+
+
+class TestParseCorridors:
+    def _repeaters(self):
+        return [
+            {"adv_name": "R55", "public_key": "5500"},
+            {"adv_name": "Rb0", "public_key": "b000"},
+            {"adv_name": "Re5", "public_key": "e500"},
+            {"adv_name": "Rc0", "public_key": "c000"},
+        ]
+
+    def test_single_corridor(self):
+        corridors = _parse_corridors("R55,Rb0,Re5", self._repeaters())
+        assert corridors == [["55", "b0", "e5"]]
+
+    def test_multiple_corridors(self):
+        corridors = _parse_corridors("R55,Rb0,Re5;R55,Rb0,Rc0", self._repeaters())
+        assert corridors == [["55", "b0", "e5"], ["55", "b0", "c0"]]
+
+    def test_preserves_order_within_corridor(self):
+        corridors = _parse_corridors("Re5,Rb0,R55", self._repeaters())
+        assert corridors == [["e5", "b0", "55"]]
+
+    def test_skips_unresolvable_waypoints(self):
+        corridors = _parse_corridors("R55,Nope,Re5", self._repeaters())
+        assert corridors == [["55", "e5"]]
+
+    def test_drops_empty_corridors(self):
+        corridors = _parse_corridors("R55,Rb0;;Nope", self._repeaters())
+        assert corridors == [["55", "b0"]]
+
+    def test_dedups_identical_corridors(self):
+        corridors = _parse_corridors("R55,Rb0;R55,Rb0", self._repeaters())
+        assert corridors == [["55", "b0"]]
+
+    def test_empty_spec(self):
+        assert _parse_corridors("", self._repeaters()) == []
+
+
+class TestSelectTailCandidates:
+    def _repeaters(self):
+        return [
+            {"adv_name": "Kyiv_Troieshchyna_R1", "public_key": "1400"},
+            {"adv_name": "Kyiv_Troieshchyna_R2", "public_key": "1500"},
+            {"adv_name": "Kyiv_Voskresenka_R1", "public_key": "f300"},
+            {"adv_name": "Lviv_Center_R1", "public_key": "ab00"},
+        ]
+
+    def test_empty_keeps_all(self):
+        assert len(_select_tail_candidates(self._repeaters(), "")) == 4
+
+    def test_by_name_prefix(self):
+        result = _select_tail_candidates(self._repeaters(), "Kyiv_Troieshchyna")
+        assert [r["adv_name"] for r in result] == [
+            "Kyiv_Troieshchyna_R1", "Kyiv_Troieshchyna_R2",
+        ]
+
+    def test_by_exact_name(self):
+        result = _select_tail_candidates(self._repeaters(), "Kyiv_Voskresenka_R1")
+        assert [r["adv_name"] for r in result] == ["Kyiv_Voskresenka_R1"]
+
+    def test_by_hex_hash(self):
+        result = _select_tail_candidates(self._repeaters(), "f3")
+        assert [r["adv_name"] for r in result] == ["Kyiv_Voskresenka_R1"]
+
+    def test_mixed_tokens(self):
+        result = _select_tail_candidates(self._repeaters(), "Kyiv_Troieshchyna,f3")
+        assert [r["adv_name"] for r in result] == [
+            "Kyiv_Troieshchyna_R1", "Kyiv_Troieshchyna_R2", "Kyiv_Voskresenka_R1",
+        ]
+
+    def test_dedups_overlapping_tokens(self):
+        result = _select_tail_candidates(self._repeaters(), "Kyiv_Tro,14")
+        assert [r["adv_name"] for r in result] == [
+            "Kyiv_Troieshchyna_R1", "Kyiv_Troieshchyna_R2",
+        ]
+
+    def test_no_match_returns_empty(self):
+        assert _select_tail_candidates(self._repeaters(), "Odesa") == []
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -194,6 +389,7 @@ class TestConfig:
         cfg = load_config(cfg_file)
         assert cfg["serial_port"] == "COM9"
         assert cfg["snr_samples"] == DEFAULTS["snr_samples"]
+        assert cfg["max_path_hops"] == DEFAULTS["max_path_hops"]
 
     def test_cli_override(self, tmp_path):
         cfg_file = tmp_path / "config.yaml"
