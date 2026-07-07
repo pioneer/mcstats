@@ -720,10 +720,11 @@ async def _probe_reachability(
             mc, probe.trace_to_roi(), timeout, retries, verbose=verbose
         )
         if trace:
-            reachable[h] = _path_min_snr(trace)
-            if verbose:
-                console.print(f"    [dim]{name} ({h}) — reachable[/]")
-        elif verbose:
+            min_snr = _path_min_snr(trace)
+            reachable[h] = min_snr
+            snr_disp = f"{min_snr:+.1f}" if min_snr is not None else "?"
+            console.print(f"    [dim]{name} ({h}) — reachable (min SNR {snr_disp})[/]")
+        else:
             console.print(f"    [dim]{name} ({h}) — not reachable[/]")
     return reachable
 
@@ -844,6 +845,8 @@ async def _bfs_find_all_paths(
                 results.append(
                     PathResult(roi_path=candidate, min_snr=min_snr, avg_snr=avg_snr, hop_names=names)
                 )
+            else:
+                console.print(f"    [dim]{' → '.join(names)} — unreachable[/]")
 
         if results and not exhaustive:
             break
@@ -917,6 +920,8 @@ async def _corridor_find_paths(
             results.append(
                 PathResult(roi_path=candidate, min_snr=min_snr, avg_snr=avg_snr, hop_names=names)
             )
+        else:
+            console.print(f"    [dim]{route} — unreachable[/]")
 
     results.sort(key=_path_sort_key)
     return results
@@ -992,6 +997,10 @@ async def find_path_thorough(
                 mc, roi_hash, corridor, hash_to_name, timeout, retries,
                 max_hops, verbose, tried=tried,
             ))
+        if results:
+            console.print(f"  [green]{len(results)}[/] working path(s) found in corridor phase")
+        else:
+            console.print("  [yellow]No corridor or subsequence reached the target.[/]")
 
         # Phase 2 — if the known routes didn't reach the ROI (or --exhaustive),
         # discover the unknown tail anchored at each corridor's far end, so we
@@ -999,6 +1008,7 @@ async def find_path_thorough(
         # by the `tail_candidates` spec (names / hashes / name-prefixes); if it
         # is empty the full pool is used.
         if exhaustive or not results:
+            n_before_tail = len(results)
             tail_spec: str = cfg.get("tail_candidates", "")
             tail_pool = _select_tail_candidates(others, tail_spec)
             if tail_spec:
@@ -1022,6 +1032,11 @@ async def find_path_thorough(
                     exhaustive, verbose,
                     prefix=corridor, tried=tried, hash_to_name_extra=hash_to_name,
                 ))
+            n_found_tail = len(results) - n_before_tail
+            if n_found_tail:
+                console.print(f"  [green]{n_found_tail}[/] working path(s) found in tail discovery")
+            else:
+                console.print("  [yellow]No tail hops reached the target.[/]")
 
         results.sort(key=_path_sort_key)
         return results
