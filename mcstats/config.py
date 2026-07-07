@@ -12,10 +12,13 @@ DEFAULTS: dict[str, Any] = {
     "repeater_of_interest_path": "",
     "repeater_prefix": "",
     "exclude_repeaters": "",
+    "path_candidates": "",
+    "tail_candidates": "",
     "snr_samples": 3,
     "timeout_penalty_db": -30,
     "flood_retries": 2,
     "trace_timeout": 15,
+    "max_path_hops": 4,
     "cache_dir": ".cache",
 }
 

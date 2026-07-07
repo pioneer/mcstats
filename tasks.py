@@ -82,6 +82,93 @@ def discover(c, roi=None, config="config.yaml", verbose=False, prefix=None, excl
 @task(
     help={
         "roi": "Name or hex hash of the repeater of interest (overrides config)",
+        "config": "Path to config YAML file (default: config.yaml)",
+        "verbose": "Enable debug-level meshcore logging",
+        "prefix": "Only consider repeaters whose name starts with this prefix as hops",
+        "exclude": "Comma-separated repeater names to exclude as hops",
+        "via": "One or more ordered corridors of known waypoints for findpath. Waypoints in a corridor are comma-separated in route order; separate multiple corridors with ';', e.g. '55,b0,e5;55,b0,c0'. findpath tests each corridor + its subsequences, then discovers any unknown tail hops beyond the corridor's far end to reach the ROI",
+        "tail": "Comma-separated repeaters to try when discovering the unknown tail beyond the corridor (findpath). Each token matches by exact name, hex hash, or name prefix, e.g. 'Kyiv_Troieshchyna,14'. Empty = try the whole pool",
+        "max-hops": "Maximum number of intermediate hops to search (overrides config)",
+        "exhaustive": "Search all hop depths and report every working path",
+        "save": "Write the best discovered path to repeater_of_interest_path in the config",
+    },
+)
+def findpath(
+    c,
+    roi=None,
+    config="config.yaml",
+    verbose=False,
+    prefix=None,
+    exclude=None,
+    via=None,
+    tail=None,
+    max_hops=None,
+    exhaustive=False,
+    save=False,
+):
+    """Thoroughly search for a working path to the target repeater."""
+
+    async def _inner():
+        from mcstats.config import load_config
+        from mcstats.connection import connect
+        from mcstats.display import show_path_results
+        from mcstats.scanner import get_roi_display, run_findpath
+
+        cfg = load_config(
+            config,
+            repeater_of_interest=roi,
+            verbose=verbose,
+            repeater_prefix=prefix,
+            exclude_repeaters=exclude,
+            path_candidates=via,
+            tail_candidates=tail,
+            max_path_hops=int(max_hops) if max_hops is not None else None,
+        )
+
+        if not cfg["repeater_of_interest"]:
+            raise SystemExit(
+                "No repeater of interest specified. "
+                "Use --roi <name> or set repeater_of_interest in config."
+            )
+
+        async with connect(cfg) as mc:
+            results = await run_findpath(mc, cfg, exhaustive=exhaustive)
+            if not results:
+                return
+            roi_name, roi_h = await get_roi_display(mc, cfg["repeater_of_interest"])
+            show_path_results(results, roi_name, roi_h)
+
+            if save:
+                best = results[0]
+                value = "direct" if not best.roi_path.intermediate_hashes else best.roi_path.prefix
+                _save_path_to_config(config, value)
+                from rich.console import Console
+                Console().print(
+                    f"  [green]Saved[/] repeater_of_interest_path: \"{value}\" → {config}"
+                )
+
+    _run(_inner())
+
+
+def _save_path_to_config(config_path: str, value: str) -> None:
+    """Update repeater_of_interest_path in the YAML config, preserving comments."""
+    import pathlib
+    import re
+
+    p = pathlib.Path(config_path)
+    text = p.read_text(encoding="utf-8")
+    new_line = f'repeater_of_interest_path: "{value}"'
+    pattern = re.compile(r'^repeater_of_interest_path:.*$', re.MULTILINE)
+    if pattern.search(text):
+        text = pattern.sub(new_line, text)
+    else:
+        text = text.rstrip("\n") + f"\n{new_line}\n"
+    p.write_text(text, encoding="utf-8")
+
+
+@task(
+    help={
+        "roi": "Name or hex hash of the repeater of interest (overrides config)",
         "samples": "Number of SNR samples per neighbour",
         "config": "Path to config YAML file (default: config.yaml)",
         "verbose": "Enable debug-level meshcore logging",
