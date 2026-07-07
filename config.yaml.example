@@ -19,6 +19,24 @@ repeater_prefix: ""
 # Comma-separated repeater names to exclude from discovery/measurement
 exclude_repeaters: ""
 
+# One or more ordered corridors of known waypoints for `invoke findpath` (names
+# or 2-char hex hashes). Waypoints in a corridor are comma-separated in route
+# order from you outward, e.g. "55,b0,e5"; separate multiple corridors with
+# ';', e.g. "55,b0,e5;55,b0,c0,e5". findpath tests each corridor + its ordered
+# subsequences, then (if the ROI isn't reached) discovers any unknown tail hops
+# anchored at the corridor's far end — so the known crossing isn't re-scanned.
+# List your reachable entry node first. Empty = full mesh search.
+# Override with --via.
+path_candidates: ""
+
+# Repeaters to try when discovering the unknown tail beyond a corridor
+# (`invoke findpath`). Comma-separated tokens; each matches a repeater by exact
+# name, 2-char hex hash, or name prefix, e.g. "Kyiv_Troieshchyna,14". Use this
+# instead of a long exclude list to keep tail discovery from spreading toward
+# repeaters that clearly can't reach the ROI. Empty = try the whole pool.
+# Override with --tail.
+tail_candidates: ""
+
 # Number of SNR trace samples to collect per neighbour
 snr_samples: 3
 
@@ -30,3 +48,7 @@ flood_retries: 3
 
 # Seconds to wait for a trace response
 trace_timeout: 15
+
+# Maximum number of intermediate hops to search when finding a path
+# (used by `invoke findpath`; override with --max-hops)
+max_path_hops: 4
